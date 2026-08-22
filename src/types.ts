@@ -106,6 +106,28 @@ export interface SlashCommandResponse {
   embeds: DiscordEmbed[];
 }
 
+export interface ReportPersonResult {
+  userId: string;
+  username: string;
+  userTag: string;
+  avatarUrl: string;
+  sessionCount: number;
+  voiceHours: number;
+  videoHours: number;
+  streamHours: number;
+  streamPercentOfTarget: number;
+  paidFull: boolean;
+}
+
+export interface ReportResponse {
+  startDate: string;
+  endDate: string;
+  targetHours: number;
+  requiredStreamHours: number;
+  requiredStreamPercent: number;
+  results: ReportPersonResult[];
+}
+
 export interface BotStatusConfig {
   mode: 'simulation' | 'live';
   discordConnected: boolean;

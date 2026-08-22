@@ -17,16 +17,31 @@ export const SessionHistoryTab: React.FC<SessionHistoryTabProps> = () => {
   const [sessions, setSessions] = useState<MemberSession[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [selectedActivity, setSelectedActivity] = useState<ActivityType | 'all'>('all');
   const [searchUser, setSearchUser] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
   const [page, setPage] = useState(0);
   const pageSize = 20;
+
+  const buildFilterParams = () => {
+    const params = new URLSearchParams();
+    if (selectedActivity !== 'all') params.append('activityType', selectedActivity);
+    if (startDate) params.append('startDate', new Date(startDate).toISOString());
+    if (endDate) {
+      // Treat the end date as inclusive of the whole day.
+      const inclusiveEnd = new Date(endDate);
+      inclusiveEnd.setHours(23, 59, 59, 999);
+      params.append('endDate', inclusiveEnd.toISOString());
+    }
+    return params;
+  };
 
   const fetchSessions = async () => {
     setLoading(true);
     try {
-      const params = new URLSearchParams();
-      if (selectedActivity !== 'all') params.append('activityType', selectedActivity);
+      const params = buildFilterParams();
       params.append('limit', String(pageSize));
       params.append('offset', String(page * pageSize));
 
@@ -41,9 +56,32 @@ export const SessionHistoryTab: React.FC<SessionHistoryTabProps> = () => {
     }
   };
 
+  // Pulls EVERY session matching the current filters (not just the page
+  // currently on screen) by paging through the API internally, so exports
+  // contain the full result set instead of whatever 20 rows are displayed.
+  const fetchAllMatchingSessions = async (): Promise<MemberSession[]> => {
+    const all: MemberSession[] = [];
+    const fetchPageSize = 1000;
+    let offset = 0;
+    while (true) {
+      const params = buildFilterParams();
+      params.append('limit', String(fetchPageSize));
+      params.append('offset', String(offset));
+
+      const res = await fetch(`/api/sessions?${params.toString()}`);
+      const data = await res.json();
+      const batch: MemberSession[] = data.sessions || [];
+      all.push(...batch);
+
+      if (!data.hasMore || batch.length === 0) break;
+      offset += fetchPageSize;
+    }
+    return all;
+  };
+
   useEffect(() => {
     fetchSessions();
-  }, [selectedActivity, page]);
+  }, [selectedActivity, startDate, endDate, page]);
 
   const formatSec = (sec: number) => {
     if (!sec || sec < 60) return `${Math.round(sec || 0)}s`;
@@ -54,43 +92,62 @@ export const SessionHistoryTab: React.FC<SessionHistoryTabProps> = () => {
     return `${m}m ${s}s`;
   };
 
-  const filtered = sessions.filter((s) =>
-    s.username.toLowerCase().includes(searchUser.toLowerCase()) ||
-    s.channelName.toLowerCase().includes(searchUser.toLowerCase())
-  );
+  const applySearchFilter = (list: MemberSession[]) =>
+    list.filter((s) =>
+      s.username.toLowerCase().includes(searchUser.toLowerCase()) ||
+      s.channelName.toLowerCase().includes(searchUser.toLowerCase())
+    );
 
-  const exportCSV = () => {
-    const headers = ['Session ID', 'User ID', 'Username', 'Activity Type', 'Channel', 'Start Time', 'End Time', 'Duration (Seconds)', 'Duration (Formatted)'];
-    const rows = filtered.map((s) => [
-      s.id,
-      s.userId,
-      s.username,
-      s.activityType,
-      `"${s.channelName}"`,
-      new Date(s.startTime).toISOString(),
-      s.endTime ? new Date(s.endTime).toISOString() : 'Ongoing',
-      s.durationSeconds,
-      `"${formatSec(s.durationSeconds)}"`
-    ]);
+  const filtered = applySearchFilter(sessions);
 
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `discord_sessions_${Date.now()}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  const exportCSV = async () => {
+    setExporting(true);
+    try {
+      const all = applySearchFilter(await fetchAllMatchingSessions());
+      const headers = ['Session ID', 'User ID', 'Username', 'Activity Type', 'Channel', 'Start Time', 'End Time', 'Duration (Seconds)', 'Duration (Formatted)'];
+      const rows = all.map((s) => [
+        s.id,
+        s.userId,
+        s.username,
+        s.activityType,
+        `"${s.channelName}"`,
+        new Date(s.startTime).toISOString(),
+        s.endTime ? new Date(s.endTime).toISOString() : 'Ongoing',
+        s.durationSeconds,
+        `"${formatSec(s.durationSeconds)}"`
+      ]);
+
+      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+      const encodedUri = encodeURI(csvContent);
+      const link = document.createElement('a');
+      link.setAttribute('href', encodedUri);
+      link.setAttribute('download', `discord_sessions_${Date.now()}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (e) {
+      console.error('Failed to export CSV:', e);
+    } finally {
+      setExporting(false);
+    }
   };
 
-  const exportJSON = () => {
-    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(filtered, null, 2));
-    const link = document.createElement('a');
-    link.setAttribute('href', dataStr);
-    link.setAttribute('download', `discord_sessions_${Date.now()}.json`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  const exportJSON = async () => {
+    setExporting(true);
+    try {
+      const all = applySearchFilter(await fetchAllMatchingSessions());
+      const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(all, null, 2));
+      const link = document.createElement('a');
+      link.setAttribute('href', dataStr);
+      link.setAttribute('download', `discord_sessions_${Date.now()}.json`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (e) {
+      console.error('Failed to export JSON:', e);
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
@@ -109,6 +166,42 @@ export const SessionHistoryTab: React.FC<SessionHistoryTabProps> = () => {
               className="w-full bg-zinc-950 border border-zinc-800 pl-9 pr-3 py-2 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-zinc-500 font-mono uppercase"
             />
           </div>
+        </div>
+
+        {/* Date Range */}
+        <div className="flex items-center gap-2 bg-zinc-950 p-1.5 border border-zinc-800 font-mono">
+          <input
+            type="date"
+            value={startDate}
+            onChange={(e) => {
+              setStartDate(e.target.value);
+              setPage(0);
+            }}
+            className="bg-zinc-900 border border-zinc-800 px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500"
+          />
+          <span className="text-zinc-600 text-xs uppercase">to</span>
+          <input
+            type="date"
+            value={endDate}
+            onChange={(e) => {
+              setEndDate(e.target.value);
+              setPage(0);
+            }}
+            className="bg-zinc-900 border border-zinc-800 px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500"
+          />
+          {(startDate || endDate) && (
+            <button
+              onClick={() => {
+                setStartDate('');
+                setEndDate('');
+                setPage(0);
+              }}
+              title="Clear date range"
+              className="px-2 py-1 text-[10px] uppercase font-bold text-zinc-500 hover:text-zinc-200"
+            >
+              Clear
+            </button>
+          )}
         </div>
 
         {/* Activity Type Badges */}
@@ -135,17 +228,19 @@ export const SessionHistoryTab: React.FC<SessionHistoryTabProps> = () => {
         <div className="flex items-center gap-2">
           <button
             onClick={exportCSV}
-            className="flex items-center gap-1.5 px-3 py-2 bg-zinc-950 hover:bg-zinc-800 text-zinc-200 text-xs font-bold uppercase tracking-wider border border-zinc-800 transition-colors"
+            disabled={exporting}
+            className="flex items-center gap-1.5 px-3 py-2 bg-zinc-950 hover:bg-zinc-800 disabled:opacity-40 text-zinc-200 text-xs font-bold uppercase tracking-wider border border-zinc-800 transition-colors"
           >
             <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
-            Export CSV
+            {exporting ? 'Exporting...' : 'Export CSV'}
           </button>
           <button
             onClick={exportJSON}
-            className="flex items-center gap-1.5 px-3 py-2 bg-zinc-950 hover:bg-zinc-800 text-zinc-200 text-xs font-bold uppercase tracking-wider border border-zinc-800 transition-colors"
+            disabled={exporting}
+            className="flex items-center gap-1.5 px-3 py-2 bg-zinc-950 hover:bg-zinc-800 disabled:opacity-40 text-zinc-200 text-xs font-bold uppercase tracking-wider border border-zinc-800 transition-colors"
           >
             <FileCode className="w-3.5 h-3.5 text-zinc-100" />
-            Export JSON
+            {exporting ? 'Exporting...' : 'Export JSON'}
           </button>
         </div>
       </section>

@@ -4,6 +4,7 @@ import { OverviewTab } from './components/OverviewTab';
 import { LiveChannelsTab } from './components/LiveChannelsTab';
 import { MembersStatsTab } from './components/MembersStatsTab';
 import { SessionHistoryTab } from './components/SessionHistoryTab';
+import { ReportsTab } from './components/ReportsTab';
 import { InactiveTab } from './components/InactiveTab';
 import { SlashCommandsTab } from './components/SlashCommandsTab';
 import {
@@ -56,7 +57,7 @@ export default function App() {
   }, [refreshAllData]);
 
   useEffect(() => {
-    const shouldLoadMembers = activeTab === 'members' || activeTab === 'inactive' || activeTab === 'commands';
+    const shouldLoadMembers = activeTab === 'members' || activeTab === 'inactive' || activeTab === 'commands' || activeTab === 'reports';
     if (!shouldLoadMembers) return;
 
     const isStale = !membersLoadedAt || Date.now() - membersLoadedAt > 60_000;
@@ -134,6 +135,10 @@ export default function App() {
 
         {activeTab === 'sessions' && (
           <SessionHistoryTab onRefresh={refreshAllData} />
+        )}
+
+        {activeTab === 'reports' && (
+          <ReportsTab members={allMembers} />
         )}
 
         {activeTab === 'inactive' && (

@@ -111,15 +111,35 @@ async function startServer() {
 
   // Session History (Paginated + Filterable)
   app.get('/api/sessions', async (req, res) => {
-    const { userId, channelId, activityType, limit, offset } = req.query;
+    const { userId, channelId, activityType, startDate, endDate, limit, offset } = req.query;
     const result = await db.getSessionHistory({
       userId: userId ? String(userId) : undefined,
       channelId: channelId ? String(channelId) : undefined,
       activityType: (activityType as any) || 'all',
+      startDate: startDate ? String(startDate) : undefined,
+      endDate: endDate ? String(endDate) : undefined,
       limit: limit ? parseInt(String(limit), 10) : 50,
       offset: offset ? parseInt(String(offset), 10) : 0,
     });
     res.json(result);
+  });
+
+  // Payroll/Attendance Report (arbitrary date range, one or more members)
+  app.post('/api/report', async (req, res) => {
+    const { userIds, startDate, endDate } = req.body;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'startDate and endDate are required' });
+    }
+    try {
+      const report = await db.getReport({
+        userIds: Array.isArray(userIds) && userIds.length > 0 ? userIds : undefined,
+        startDate: String(startDate),
+        endDate: String(endDate),
+      });
+      res.json(report);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message || 'Failed to generate report' });
+    }
   });
 
   // User Stats (/stats)

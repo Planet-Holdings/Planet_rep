@@ -436,6 +436,8 @@ class DatabaseManager {
     userId?: string;
     channelId?: string;
     activityType?: ActivityType | 'all';
+    startDate?: string;
+    endDate?: string;
     limit?: number;
     offset?: number;
   }) {
@@ -443,7 +445,7 @@ class DatabaseManager {
       .from('sessions')
       .select('*', { count: 'exact' })
       .order('start_time', { ascending: false });
-    
+
     if (filters.userId) {
       query = query.eq('user_id', filters.userId);
     }
@@ -453,7 +455,13 @@ class DatabaseManager {
     if (filters.activityType && filters.activityType !== 'all') {
       query = query.eq('activity_type', filters.activityType);
     }
-    
+    if (filters.startDate) {
+      query = query.gte('start_time', filters.startDate);
+    }
+    if (filters.endDate) {
+      query = query.lte('start_time', filters.endDate);
+    }
+
     const offset = filters.offset || 0;
     const limit = filters.limit || 50;
     
@@ -489,6 +497,121 @@ class DatabaseManager {
       sessions,
       total,
       hasMore: offset + limit < total,
+    };
+  }
+
+  // Payroll-style report: aggregate voice/video/stream time per member over an
+  // arbitrary date range, and check attendance against a target of 160 hours
+  // (40hrs x 4 weeks), where at least 80% of that (128 hours) must be streamed
+  // for the member to be considered paid in full.
+  public async getReport(params: { userIds?: string[]; startDate: string; endDate: string }) {
+    const TARGET_HOURS = 160;
+    const REQUIRED_STREAM_PCT = 0.8;
+    const REQUIRED_STREAM_HOURS = TARGET_HOURS * REQUIRED_STREAM_PCT;
+
+    let query = supabase
+      .from('sessions')
+      .select('*')
+      .gte('start_time', params.startDate)
+      .lte('start_time', params.endDate);
+
+    if (params.userIds && params.userIds.length > 0) {
+      query = query.in('user_id', params.userIds);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('[Supabase] getReport error:', error);
+      throw new Error(error.message || 'Failed to load report data');
+    }
+
+    const byUser = new Map<string, {
+      userId: string;
+      username: string;
+      userTag: string;
+      avatarUrl: string;
+      voiceSeconds: number;
+      videoSeconds: number;
+      streamSeconds: number;
+      sessionCount: number;
+    }>();
+
+    for (const s of data || []) {
+      let entry = byUser.get(s.user_id);
+      if (!entry) {
+        entry = {
+          userId: s.user_id,
+          username: s.username,
+          userTag: s.user_tag,
+          avatarUrl: s.avatar_url,
+          voiceSeconds: 0,
+          videoSeconds: 0,
+          streamSeconds: 0,
+          sessionCount: 0,
+        };
+        byUser.set(s.user_id, entry);
+      }
+      entry.sessionCount += 1;
+      if (s.activity_type === 'voice') entry.voiceSeconds += s.duration_seconds;
+      else if (s.activity_type === 'video') entry.videoSeconds += s.duration_seconds;
+      else if (s.activity_type === 'stream') entry.streamSeconds += s.duration_seconds;
+    }
+
+    // Ensure every requested member appears in the report even with zero activity
+    if (params.userIds) {
+      for (const userId of params.userIds) {
+        if (!byUser.has(userId)) {
+          const { data: member } = await supabase
+            .from('guild_members')
+            .select('*')
+            .eq('user_id', userId)
+            .maybeSingle();
+          byUser.set(userId, {
+            userId,
+            username: member?.username || 'Unknown',
+            userTag: member?.user_tag || 'unknown',
+            avatarUrl: member?.avatar_url || '',
+            voiceSeconds: 0,
+            videoSeconds: 0,
+            streamSeconds: 0,
+            sessionCount: 0,
+          });
+        }
+      }
+    }
+
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+
+    const results = Array.from(byUser.values()).map((entry) => {
+      const voiceHours = round2(entry.voiceSeconds / 3600);
+      const videoHours = round2(entry.videoSeconds / 3600);
+      const streamHours = round2(entry.streamSeconds / 3600);
+      const streamPercentOfTarget = round2((streamHours / TARGET_HOURS) * 100);
+      const paidFull = streamHours >= REQUIRED_STREAM_HOURS;
+
+      return {
+        userId: entry.userId,
+        username: entry.username,
+        userTag: entry.userTag,
+        avatarUrl: entry.avatarUrl,
+        sessionCount: entry.sessionCount,
+        voiceHours,
+        videoHours,
+        streamHours,
+        streamPercentOfTarget,
+        paidFull,
+      };
+    });
+
+    results.sort((a, b) => b.streamHours - a.streamHours);
+
+    return {
+      startDate: params.startDate,
+      endDate: params.endDate,
+      targetHours: TARGET_HOURS,
+      requiredStreamHours: REQUIRED_STREAM_HOURS,
+      requiredStreamPercent: REQUIRED_STREAM_PCT * 100,
+      results,
     };
   }
 
