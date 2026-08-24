@@ -178,6 +178,11 @@ export async function getReport(params) {
   const { data, error } = await query;
   if (error) throw new Error(error.message || 'Failed to load report data');
 
+  // Local calendar-day key (not UTC) so "login"/"logout" line up with the
+  // day a rep actually experienced.
+  const dayKey = (d) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
   const byUser = new Map();
 
   for (const s of data || []) {
@@ -192,6 +197,7 @@ export async function getReport(params) {
         videoSeconds: 0,
         streamSeconds: 0,
         sessionCount: 0,
+        days: new Map(),
       };
       byUser.set(s.user_id, entry);
     }
@@ -199,6 +205,20 @@ export async function getReport(params) {
     if (s.activity_type === 'voice') entry.voiceSeconds += s.duration_seconds;
     else if (s.activity_type === 'video') entry.videoSeconds += s.duration_seconds;
     else if (s.activity_type === 'stream') entry.streamSeconds += s.duration_seconds;
+
+    if (s.activity_type === 'voice') {
+      const startMs = new Date(s.start_time).getTime();
+      const endMs = new Date(s.end_time).getTime();
+      const key = dayKey(new Date(s.start_time));
+      const day = entry.days.get(key);
+      if (!day) {
+        entry.days.set(key, { loginMs: startMs, logoutMs: endMs, voiceSeconds: s.duration_seconds });
+      } else {
+        day.loginMs = Math.min(day.loginMs, startMs);
+        day.logoutMs = Math.max(day.logoutMs, endMs);
+        day.voiceSeconds += s.duration_seconds;
+      }
+    }
   }
 
   if (params.userIds) {
@@ -218,12 +238,18 @@ export async function getReport(params) {
           videoSeconds: 0,
           streamSeconds: 0,
           sessionCount: 0,
+          days: new Map(),
         });
       }
     }
   }
 
   const round2 = (n) => Math.round(n * 100) / 100;
+  const formatTimeOfDay = (minutesOfDay) => {
+    const h = Math.floor(minutesOfDay / 60);
+    const m = Math.round(minutesOfDay % 60);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+  };
 
   const results = Array.from(byUser.values()).map((entry) => {
     const voiceHours = round2(entry.voiceSeconds / 3600);
@@ -231,6 +257,30 @@ export async function getReport(params) {
     const streamHours = round2(entry.streamSeconds / 3600);
     const streamPercentOfTarget = round2((streamHours / TARGET_HOURS) * 100);
     const paidFull = streamHours >= REQUIRED_STREAM_HOURS;
+
+    const dayBuckets = Array.from(entry.days.values());
+    const daysActive = dayBuckets.length;
+    let totalSpanSeconds = 0;
+    let totalBreakSeconds = 0;
+    let loginMinutesSum = 0;
+    let logoutMinutesSum = 0;
+
+    for (const d of dayBuckets) {
+      const spanSeconds = Math.max(0, (d.logoutMs - d.loginMs) / 1000);
+      totalSpanSeconds += spanSeconds;
+      totalBreakSeconds += Math.max(0, spanSeconds - d.voiceSeconds);
+
+      const loginDate = new Date(d.loginMs);
+      const logoutDate = new Date(d.logoutMs);
+      loginMinutesSum += loginDate.getHours() * 60 + loginDate.getMinutes();
+      logoutMinutesSum += logoutDate.getHours() * 60 + logoutDate.getMinutes();
+    }
+
+    const totalHours = round2(totalSpanSeconds / 3600);
+    const totalHoursPercentOfTarget = round2((totalHours / TARGET_HOURS) * 100);
+    const breakHours = round2(totalBreakSeconds / 3600);
+    const avgLoginTime = daysActive > 0 ? formatTimeOfDay(loginMinutesSum / daysActive) : null;
+    const avgLogoutTime = daysActive > 0 ? formatTimeOfDay(logoutMinutesSum / daysActive) : null;
 
     return {
       userId: entry.userId,
@@ -243,6 +293,12 @@ export async function getReport(params) {
       streamHours,
       streamPercentOfTarget,
       paidFull,
+      daysActive,
+      avgLoginTime,
+      avgLogoutTime,
+      breakHours,
+      totalHours,
+      totalHoursPercentOfTarget,
     };
   });
 

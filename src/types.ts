@@ -117,6 +117,12 @@ export interface ReportPersonResult {
   streamHours: number;
   streamPercentOfTarget: number;
   paidFull: boolean;
+  daysActive: number;
+  avgLoginTime: string | null;
+  avgLogoutTime: string | null;
+  breakHours: number;
+  totalHours: number;
+  totalHoursPercentOfTarget: number;
 }
 
 export interface ReportResponse {

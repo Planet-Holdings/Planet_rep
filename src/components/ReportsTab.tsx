@@ -13,12 +13,32 @@ interface ReportsTabProps {
   members: GuildMemberSummary[];
 }
 
+const toInputValue = (d: Date) => {
+  // Local date, not UTC, so "today" doesn't shift a day depending on timezone.
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
 // Default report window: the current calendar month.
 const defaultDates = () => {
   const now = new Date();
   const start = new Date(now.getFullYear(), now.getMonth(), 1);
-  const toInputValue = (d: Date) => d.toISOString().slice(0, 10);
   return { start: toInputValue(start), end: toInputValue(now) };
+};
+
+const thisMonthRange = () => {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  return { start: toInputValue(start), end: toInputValue(now) };
+};
+
+const lastMonthRange = () => {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const end = new Date(now.getFullYear(), now.getMonth(), 0);
+  return { start: toInputValue(start), end: toInputValue(end) };
 };
 
 export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
@@ -86,7 +106,9 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
   const exportReportCSV = () => {
     if (!report) return;
     const headers = [
-      'User ID', 'Username', 'Sessions',
+      'User ID', 'Username', 'Days Active', 'Avg Login Time', 'Avg Logout Time',
+      'Break/Lunch Hours', `Total Hours (of ${report.targetHours}h Target)`,
+      `% of ${report.targetHours}h Target`, 'Sessions',
       'Voice Hours', 'Stream Hours', 'Video Hours',
       `% of ${report.targetHours}h Target Streamed`,
       `Paid Full (>= ${report.requiredStreamHours}h streamed)`
@@ -94,6 +116,12 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
     const rows = report.results.map((r) => [
       r.userId,
       r.username,
+      r.daysActive,
+      r.avgLoginTime || 'N/A',
+      r.avgLogoutTime || 'N/A',
+      r.breakHours,
+      r.totalHours,
+      r.totalHoursPercentOfTarget,
       r.sessionCount,
       r.voiceHours,
       r.streamHours,
@@ -195,6 +223,28 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
         <h2 className="text-xs font-bold uppercase tracking-[0.2em] text-zinc-500 mb-4">
           02. Report Window
         </h2>
+        <div className="flex flex-wrap items-center gap-2 mb-4">
+          <button
+            onClick={() => {
+              const r = thisMonthRange();
+              setStartDate(r.start);
+              setEndDate(r.end);
+            }}
+            className="px-3 py-1.5 bg-zinc-950 hover:bg-zinc-800 text-zinc-300 text-[10px] font-bold uppercase tracking-wider border border-zinc-800 transition-colors"
+          >
+            This Month
+          </button>
+          <button
+            onClick={() => {
+              const r = lastMonthRange();
+              setStartDate(r.start);
+              setEndDate(r.end);
+            }}
+            className="px-3 py-1.5 bg-zinc-950 hover:bg-zinc-800 text-zinc-300 text-[10px] font-bold uppercase tracking-wider border border-zinc-800 transition-colors"
+          >
+            Last Month
+          </button>
+        </div>
         <div className="flex flex-wrap items-end gap-4">
           <div>
             <label className="block text-[10px] uppercase font-bold text-zinc-500 mb-1.5">From</label>
@@ -238,6 +288,9 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
         <p className="mt-3 text-[10px] text-zinc-600 font-mono uppercase">
           Attendance target: 160 hrs (40hrs x 4 weeks) — full pay requires streaming at least 80% of that (128 hrs).
         </p>
+        <p className="mt-1 text-[10px] text-zinc-700 font-mono uppercase">
+          Login/logout are averaged from each day's first voice join and last voice leave. Break/lunch is time between voice sessions within that daily span.
+        </p>
       </section>
 
       {/* 03. Results */}
@@ -257,9 +310,15 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
               <thead className="bg-zinc-950 text-zinc-500 uppercase font-black text-[10px] tracking-wider border-b border-zinc-800">
                 <tr>
                   <th className="py-3 px-4">Member</th>
+                  <th className="py-3 px-4 text-right">Days Active</th>
+                  <th className="py-3 px-4 text-right">Avg Login</th>
+                  <th className="py-3 px-4 text-right">Avg Logout</th>
+                  <th className="py-3 px-4 text-right">Break/Lunch</th>
+                  <th className="py-3 px-4 text-right">Total Hours</th>
+                  <th className="py-3 px-4 text-right">% of Target</th>
                   <th className="py-3 px-4 text-right">Sessions</th>
                   <th className="py-3 px-4 text-right">Voice Hours</th>
-                  <th className="py-3 px-4 text-right">Stream Hours</th>
+                  <th className="py-3 px-4 text-right">Screen Active (Stream) Hours</th>
                   <th className="py-3 px-4 text-right">Video Hours</th>
                   <th className="py-3 px-4 text-right">% of Target Streamed</th>
                   <th className="py-3 px-4 text-right">Status</th>
@@ -268,7 +327,7 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
               <tbody className="divide-y divide-zinc-800/80">
                 {report.results.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="py-8 text-center text-zinc-600 uppercase">
+                    <td colSpan={13} className="py-8 text-center text-zinc-600 uppercase">
                       No activity found for this selection and range.
                     </td>
                   </tr>
@@ -288,6 +347,12 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
                           </div>
                         </div>
                       </td>
+                      <td className="py-3 px-4 text-right text-zinc-400">{r.daysActive}</td>
+                      <td className="py-3 px-4 text-right text-zinc-300">{r.avgLoginTime || '—'}</td>
+                      <td className="py-3 px-4 text-right text-zinc-300">{r.avgLogoutTime || '—'}</td>
+                      <td className="py-3 px-4 text-right text-zinc-400">{r.breakHours.toFixed(1)}h</td>
+                      <td className="py-3 px-4 text-right font-black text-zinc-100">{r.totalHours.toFixed(1)}h</td>
+                      <td className="py-3 px-4 text-right text-zinc-300">{r.totalHoursPercentOfTarget.toFixed(1)}%</td>
                       <td className="py-3 px-4 text-right text-zinc-400">{r.sessionCount}</td>
                       <td className="py-3 px-4 text-right text-zinc-200">{r.voiceHours.toFixed(1)}h</td>
                       <td className="py-3 px-4 text-right font-bold text-zinc-100">{r.streamHours.toFixed(1)}h</td>
