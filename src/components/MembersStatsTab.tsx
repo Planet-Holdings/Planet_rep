@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Users,
   Search,
@@ -26,6 +26,55 @@ export const MembersStatsTab: React.FC<MembersStatsTabProps> = ({
   const [selectedMember, setSelectedMember] = useState<GuildMemberSummary | null>(null);
   const [userStatsDetail, setUserStatsDetail] = useState<any | null>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
+
+  // Per-member totals for the selected timeframe, keyed by userId. The
+  // `members` prop is always all-time, so the grid cards need their own
+  // fetch whenever the timeframe toggle changes.
+  const [timeframeStats, setTimeframeStats] = useState<Record<string, {
+    totalVoiceSeconds: number;
+    totalVideoSeconds: number;
+    totalStreamSeconds: number;
+    sessionCount: number;
+  }>>({});
+  const [isLoadingGrid, setIsLoadingGrid] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadTimeframeStats = async () => {
+      if (timeframe === 'all') {
+        // The `members` prop is already all-time, no extra fetch needed.
+        if (!cancelled) setTimeframeStats({});
+        return;
+      }
+      setIsLoadingGrid(true);
+      try {
+        const res = await fetch(`/api/leaderboard?timeframe=${timeframe}`);
+        const data = await res.json();
+        const map: Record<string, { totalVoiceSeconds: number; totalVideoSeconds: number; totalStreamSeconds: number; sessionCount: number }> = {};
+        for (const entry of data.leaderboard || []) {
+          const userId = entry.user?.userId;
+          if (!userId) continue;
+          map[userId] = {
+            totalVoiceSeconds: entry.totalVoiceSeconds || 0,
+            totalVideoSeconds: entry.totalVideoSeconds || 0,
+            totalStreamSeconds: entry.totalStreamSeconds || 0,
+            sessionCount: entry.sessionCount || 0,
+          };
+        }
+        if (!cancelled) setTimeframeStats(map);
+      } catch (e) {
+        console.error('Failed to load timeframe stats:', e);
+      } finally {
+        if (!cancelled) setIsLoadingGrid(false);
+      }
+    };
+
+    loadTimeframeStats();
+    return () => {
+      cancelled = true;
+    };
+  }, [timeframe]);
 
   const formatSec = (sec: number) => {
     if (!sec || sec < 60) return `${Math.round(sec || 0)}s`;
@@ -99,15 +148,22 @@ export const MembersStatsTab: React.FC<MembersStatsTabProps> = ({
           <h2 className="text-xs font-bold uppercase tracking-[0.2em] text-zinc-500">
             02. Member Activity Directory ({filteredMembers.length})
           </h2>
-          <span className="text-[10px] uppercase font-mono text-zinc-500">Voice / Video / Stream Split</span>
+          <span className="text-[10px] uppercase font-mono text-zinc-500">
+            {isLoadingGrid ? 'Loading timeframe stats...' : 'Voice / Video / Stream Split'}
+          </span>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
           {filteredMembers.map((m, idx) => {
-            const totalSec = m.totalVoiceSeconds + m.totalVideoSeconds + m.totalStreamSeconds;
-            const vPct = totalSec > 0 ? Math.round((m.totalVoiceSeconds / totalSec) * 100) : 0;
-            const vidPct = totalSec > 0 ? Math.round((m.totalVideoSeconds / totalSec) * 100) : 0;
-            const strPct = totalSec > 0 ? Math.round((m.totalStreamSeconds / totalSec) * 100) : 0;
+            const stats = timeframe === 'all' ? null : timeframeStats[m.userId];
+            const voiceSec = stats ? stats.totalVoiceSeconds : m.totalVoiceSeconds;
+            const videoSec = stats ? stats.totalVideoSeconds : m.totalVideoSeconds;
+            const streamSec = stats ? stats.totalStreamSeconds : m.totalStreamSeconds;
+            const sessionCount = stats ? stats.sessionCount : m.totalSessions;
+            const totalSec = voiceSec + videoSec + streamSec;
+            const vPct = totalSec > 0 ? Math.round((voiceSec / totalSec) * 100) : 0;
+            const vidPct = totalSec > 0 ? Math.round((videoSec / totalSec) * 100) : 0;
+            const strPct = totalSec > 0 ? Math.round((streamSec / totalSec) * 100) : 0;
 
             return (
               <div
@@ -149,7 +205,7 @@ export const MembersStatsTab: React.FC<MembersStatsTabProps> = ({
                         Voice
                       </span>
                       <span className="text-xs font-black text-emerald-400 mt-0.5 block font-mono">
-                        {formatSec(m.totalVoiceSeconds)}
+                        {formatSec(voiceSec)}
                       </span>
                     </div>
                     <div>
@@ -157,7 +213,7 @@ export const MembersStatsTab: React.FC<MembersStatsTabProps> = ({
                         Video
                       </span>
                       <span className="text-xs font-black text-sky-400 mt-0.5 block font-mono">
-                        {formatSec(m.totalVideoSeconds)}
+                        {formatSec(videoSec)}
                       </span>
                     </div>
                     <div>
@@ -165,7 +221,7 @@ export const MembersStatsTab: React.FC<MembersStatsTabProps> = ({
                         Stream
                       </span>
                       <span className="text-xs font-black text-rose-400 mt-0.5 block font-mono">
-                        {formatSec(m.totalStreamSeconds)}
+                        {formatSec(streamSec)}
                       </span>
                     </div>
                   </div>
@@ -180,7 +236,7 @@ export const MembersStatsTab: React.FC<MembersStatsTabProps> = ({
                       </div>
                       <div className="flex justify-between text-[10px] text-zinc-500 font-mono uppercase font-bold">
                         <span>Total: {formatSec(totalSec)}</span>
-                        <span>{m.totalSessions} sessions</span>
+                        <span>{sessionCount} sessions</span>
                       </div>
                     </div>
                   )}

@@ -117,8 +117,10 @@ export const LiveChannelsTab: React.FC<LiveChannelsTabProps> = ({
           <div className="sm:col-span-2 flex flex-wrap items-center gap-2">
             {!currentActiveUser ? (
               <button
-                onClick={() => onTriggerQuickAction('join_voice', selectedUser, selectedChanObj.id, selectedChanObj.name)}
-                className="flex-1 px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-black uppercase tracking-wider flex items-center justify-center gap-1.5 transition-colors"
+                onClick={() => selectedChanObj && onTriggerQuickAction('join_voice', selectedUser, selectedChanObj.id, selectedChanObj.name)}
+                disabled={!selectedChanObj}
+                title={!selectedChanObj ? 'No voice channels available yet' : undefined}
+                className="flex-1 px-4 py-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed text-black text-xs font-black uppercase tracking-wider flex items-center justify-center gap-1.5 transition-colors"
               >
                 <Mic className="w-3.5 h-3.5" />
                 Join Channel
@@ -150,9 +152,10 @@ export const LiveChannelsTab: React.FC<LiveChannelsTabProps> = ({
                 </button>
 
                 <button
-                  onClick={() => onTriggerQuickAction('switch_channel', selectedUser, selectedChanObj.id, selectedChanObj.name)}
-                  className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-100 text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-1 transition-all border border-zinc-700"
-                  title="Switch to selected channel"
+                  onClick={() => selectedChanObj && onTriggerQuickAction('switch_channel', selectedUser, selectedChanObj.id, selectedChanObj.name)}
+                  disabled={!selectedChanObj}
+                  className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-100 text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-1 transition-all border border-zinc-700"
+                  title={!selectedChanObj ? 'No voice channels available yet' : 'Switch to selected channel'}
                 >
                   <ArrowRightLeft className="w-3.5 h-3.5" />
                   Switch

@@ -15,6 +15,22 @@ export function getDiscordStatus() {
   };
 }
 
+export async function sendReminderDM(userId: string, message: string) {
+  if (!discordClient || !isConnected) {
+    // Simulator mode: no live bot connection, so there's nothing to actually
+    // send. Report that plainly instead of pretending a DM went out.
+    return { sent: false, simulated: true, error: 'Bot is not connected (simulator mode) - no DM was actually sent.' };
+  }
+  try {
+    const user = await discordClient.users.fetch(userId);
+    await user.send(message);
+    return { sent: true, simulated: false };
+  } catch (error: any) {
+    console.error(`[Discord Bot] Failed to DM ${userId}:`, error);
+    return { sent: false, simulated: false, error: error.message || 'Failed to send DM' };
+  }
+}
+
 export async function initDiscordBot(token?: string) {
   const botToken = token || process.env.DISCORD_BOT_TOKEN;
   if (!botToken || botToken.trim() === '') {

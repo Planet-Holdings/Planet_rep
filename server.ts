@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/db';
 import { botEngine } from './server/botEngine';
-import { initDiscordBot, getDiscordStatus } from './server/discordBot';
+import { initDiscordBot, getDiscordStatus, sendReminderDM } from './server/discordBot';
 
 dotenv.config();
 
@@ -89,6 +89,20 @@ async function startServer() {
     } catch (e: any) {
       res.status(500).json({ error: e.message || 'Failed to connect bot' });
     }
+  });
+
+  // Send an inactivity reminder DM to a member
+  app.post('/api/bot/send-reminder', async (req, res) => {
+    const { userId, username, daysSinceLastActive } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+    const message = `Hey${username ? ` ${username}` : ''}! We noticed you haven't been active in voice chat for ${daysSinceLastActive ?? 'a while'} days. Come join us when you get a chance!`;
+    const result = await sendReminderDM(userId, message);
+    if (!result.sent) {
+      return res.status(result.simulated ? 409 : 500).json(result);
+    }
+    res.json(result);
   });
 
   // Overview Analytics
@@ -219,6 +233,9 @@ async function startServer() {
     const { action, userId, channelId, channelName } = req.body;
     const allMembers = await db.getGuildMembers();
     const targetMember = allMembers.find(m => m.userId === userId) || allMembers[0];
+    if (!targetMember) {
+      return res.status(400).json({ error: 'No guild members available to simulate yet. Have someone join a voice channel first.' });
+    }
     const current = await db.getActiveState(targetMember.userId);
 
     const now = Date.now();

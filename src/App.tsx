@@ -74,11 +74,15 @@ export default function App() {
     channelName?: string
   ) => {
     try {
-      await fetch('/api/simulate/quick-action', {
+      const res = await fetch('/api/simulate/quick-action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, userId, channelId, channelName }),
       });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        console.warn('Quick action failed:', err.error || res.statusText);
+      }
       await refreshAllData();
     } catch (e) {
       console.error('Error triggering quick action:', e);

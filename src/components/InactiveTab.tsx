@@ -19,7 +19,7 @@ export const InactiveTab: React.FC<InactiveTabProps> = ({
   const [thresholdDays, setThresholdDays] = useState(7);
   const [inactiveData, setInactiveData] = useState<any>(null);
   const [loading, setLoading] = useState(false);
-  const [reminderSent, setReminderSent] = useState<Record<string, boolean>>({});
+  const [reminderStatus, setReminderStatus] = useState<Record<string, 'sending' | 'sent' | 'failed'>>({});
 
   const fetchInactive = async (days: number) => {
     setLoading(true);
@@ -38,11 +38,35 @@ export const InactiveTab: React.FC<InactiveTabProps> = ({
     fetchInactive(thresholdDays);
   }, [thresholdDays]);
 
-  const handleSendReminder = (userId: string) => {
-    setReminderSent((prev) => ({ ...prev, [userId]: true }));
-    setTimeout(() => {
-      setReminderSent((prev) => ({ ...prev, [userId]: false }));
-    }, 3000);
+  const handleSendReminder = async (member: GuildMemberSummary) => {
+    setReminderStatus((prev) => ({ ...prev, [member.userId]: 'sending' }));
+    try {
+      const res = await fetch('/api/bot/send-reminder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: member.userId,
+          username: member.username,
+          daysSinceLastActive: member.daysSinceLastActive,
+        }),
+      });
+      const data = await res.json();
+      setReminderStatus((prev) => ({ ...prev, [member.userId]: data.sent ? 'sent' : 'failed' }));
+      if (!data.sent) {
+        console.warn(`Reminder not sent to ${member.username}:`, data.error);
+      }
+    } catch (e) {
+      console.error('Failed to send reminder:', e);
+      setReminderStatus((prev) => ({ ...prev, [member.userId]: 'failed' }));
+    } finally {
+      setTimeout(() => {
+        setReminderStatus((prev) => {
+          const next = { ...prev };
+          delete next[member.userId];
+          return next;
+        });
+      }, 4000);
+    }
   };
 
   const inactiveMembers: GuildMemberSummary[] = inactiveData?.inactiveMembers || [];
@@ -213,15 +237,24 @@ export const InactiveTab: React.FC<InactiveTabProps> = ({
                     </td>
                     <td className="py-3 px-4 text-right">
                       <button
-                        onClick={() => handleSendReminder(m.userId)}
-                        className={`px-3 py-1.5 text-xs font-black uppercase tracking-wider flex items-center gap-1.5 ml-auto transition-all ${
-                          reminderSent[m.userId]
+                        onClick={() => handleSendReminder(m)}
+                        disabled={reminderStatus[m.userId] === 'sending'}
+                        className={`px-3 py-1.5 text-xs font-black uppercase tracking-wider flex items-center gap-1.5 ml-auto transition-all disabled:opacity-60 ${
+                          reminderStatus[m.userId] === 'sent'
                             ? 'bg-emerald-500 text-black'
+                            : reminderStatus[m.userId] === 'failed'
+                            ? 'bg-rose-500 text-black'
                             : 'bg-zinc-950 hover:bg-zinc-800 text-zinc-200 border border-zinc-800'
                         }`}
                       >
                         <Bell className="w-3.5 h-3.5" />
-                        {reminderSent[m.userId] ? 'PING SENT!' : 'SEND DISCORD PING'}
+                        {reminderStatus[m.userId] === 'sending'
+                          ? 'SENDING...'
+                          : reminderStatus[m.userId] === 'sent'
+                          ? 'PING SENT!'
+                          : reminderStatus[m.userId] === 'failed'
+                          ? 'NOT SENT (BOT OFFLINE)'
+                          : 'SEND DISCORD PING'}
                       </button>
                     </td>
                   </tr>
