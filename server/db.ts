@@ -531,6 +531,26 @@ class DatabaseManager {
     const dayKey = (d: Date) =>
       `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
+    // Splits a [startMs, endMs) interval at local-midnight boundaries so a
+    // session that runs past midnight contributes to each calendar day it
+    // actually touched, instead of being attributed entirely to its start day.
+    const splitByLocalDay = (startMs: number, endMs: number) => {
+      const segments: { key: string; startMs: number; endMs: number }[] = [];
+      let cursor = startMs;
+      while (cursor < endMs) {
+        const cursorDate = new Date(cursor);
+        const nextDayStart = new Date(
+          cursorDate.getFullYear(),
+          cursorDate.getMonth(),
+          cursorDate.getDate() + 1
+        ).getTime();
+        const segmentEnd = Math.min(endMs, nextDayStart);
+        segments.push({ key: dayKey(cursorDate), startMs: cursor, endMs: segmentEnd });
+        cursor = segmentEnd;
+      }
+      return segments;
+    };
+
     const byUser = new Map<string, {
       userId: string;
       username: string;
@@ -570,14 +590,16 @@ class DatabaseManager {
       if (s.activity_type === 'voice') {
         const startMs = new Date(s.start_time).getTime();
         const endMs = new Date(s.end_time).getTime();
-        const key = dayKey(new Date(s.start_time));
-        const day = entry.days.get(key);
-        if (!day) {
-          entry.days.set(key, { loginMs: startMs, logoutMs: endMs, voiceSeconds: s.duration_seconds });
-        } else {
-          day.loginMs = Math.min(day.loginMs, startMs);
-          day.logoutMs = Math.max(day.logoutMs, endMs);
-          day.voiceSeconds += s.duration_seconds;
+        for (const seg of splitByLocalDay(startMs, endMs)) {
+          const segSeconds = (seg.endMs - seg.startMs) / 1000;
+          const day = entry.days.get(seg.key);
+          if (!day) {
+            entry.days.set(seg.key, { loginMs: seg.startMs, logoutMs: seg.endMs, voiceSeconds: segSeconds });
+          } else {
+            day.loginMs = Math.min(day.loginMs, seg.startMs);
+            day.logoutMs = Math.max(day.logoutMs, seg.endMs);
+            day.voiceSeconds += segSeconds;
+          }
         }
       }
     }
