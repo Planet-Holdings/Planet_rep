@@ -106,33 +106,9 @@ export interface SlashCommandResponse {
   embeds: DiscordEmbed[];
 }
 
-export interface ReportPersonResult {
-  userId: string;
-  username: string;
-  userTag: string;
-  avatarUrl: string;
-  sessionCount: number;
-  voiceHours: number;
-  videoHours: number;
-  streamHours: number;
-  streamPercentOfTarget: number;
-  paidFull: boolean;
-  daysActive: number;
-  avgLoginTime: string | null;
-  avgLogoutTime: string | null;
-  breakHours: number;
-  totalHours: number;
-  totalHoursPercentOfTarget: number;
-}
-
-export interface ReportResponse {
-  startDate: string;
-  endDate: string;
-  targetHours: number;
-  requiredStreamHours: number;
-  requiredStreamPercent: number;
-  results: ReportPersonResult[];
-}
+// Attendance / payroll report shapes are defined next to the computation so the
+// server and the UI can never drift apart.
+export type { ReportPersonResult, ReportResponse, DayResult, DayStatus } from '../server/attendance';
 
 export interface BotStatusConfig {
   mode: 'simulation' | 'live';

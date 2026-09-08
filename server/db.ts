@@ -8,6 +8,7 @@ import {
   AlertLogItem,
   VoiceChannelData
 } from '../src/types';
+import { buildAttendanceReport, configFromEnv, resolveRange } from './attendance';
 
 dotenv.config();
 
@@ -500,206 +501,72 @@ class DatabaseManager {
     };
   }
 
-  // Payroll-style report: aggregate voice/video/stream time per member over an
-  // arbitrary date range, and check attendance against a target of 160 hours
-  // (40hrs x 4 weeks), where at least 80% of that (128 hours) must be streamed
-  // for the member to be considered paid in full.
+  // Payroll / attendance report over an arbitrary date range.
+  // The target scales with the range: (Mon–Fri working days) x TARGET_HOURS_PER_DAY
+  // (default 8h) — so a week is 40h, two weeks 80h, four weeks 160h. Full pay
+  // requires REQUIRED_STREAM_PCT (default 80%) of that target to be streamed.
+  // Clock-in/out, lunch and late/early-leave are computed against the office
+  // schedule (SCHEDULE_START–SCHEDULE_END, default 09:00–18:30 America/New_York).
+  // All computation lives in ./attendance so the Vercel API shares it.
   public async getReport(params: { userIds?: string[]; startDate: string; endDate: string }) {
-    const TARGET_HOURS = 160;
-    const REQUIRED_STREAM_PCT = 0.8;
-    const REQUIRED_STREAM_HOURS = TARGET_HOURS * REQUIRED_STREAM_PCT;
+    const config = configFromEnv();
+    const range = resolveRange(params.startDate, params.endDate, config.timezone);
+    const rangeStartIso = new Date(range.startMs).toISOString();
+    const rangeEndIso = new Date(range.endMs).toISOString();
 
+    // Any session overlapping the window (not just those starting inside it),
+    // so a shift that crosses the window edge still counts the inside part.
     let query = supabase
       .from('sessions')
       .select('*')
-      .gte('start_time', params.startDate)
-      .lte('start_time', params.endDate);
-
+      .lt('start_time', rangeEndIso)
+      .gt('end_time', rangeStartIso);
     if (params.userIds && params.userIds.length > 0) {
       query = query.in('user_id', params.userIds);
     }
 
-    const { data, error } = await query;
-    if (error) {
-      console.error('[Supabase] getReport error:', error);
-      throw new Error(error.message || 'Failed to load report data');
+    const guildIdFilter = process.env.DISCORD_GUILD_ID;
+    let activeQuery = supabase.from('active_states').select('*');
+    if (guildIdFilter) activeQuery = activeQuery.eq('guild_id', guildIdFilter);
+    if (params.userIds && params.userIds.length > 0) {
+      activeQuery = activeQuery.in('user_id', params.userIds);
     }
 
-    // Local calendar-day key (not UTC) so "login"/"logout" line up with the
-    // day a rep actually experienced, matching the convention already used
-    // by getOverviewAnalytics's dailyBreakdown.
-    const dayKey = (d: Date) =>
-      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const [sessionsRes, activeRes] = await Promise.all([query, activeQuery]);
+    if (sessionsRes.error) {
+      console.error('[Supabase] getReport error:', sessionsRes.error);
+      throw new Error(sessionsRes.error.message || 'Failed to load report data');
+    }
+    if (activeRes.error) {
+      console.error('[Supabase] getReport active_states error:', activeRes.error);
+    }
 
-    // Splits a [startMs, endMs) interval at local-midnight boundaries so a
-    // session that runs past midnight contributes to each calendar day it
-    // actually touched, instead of being attributed entirely to its start day.
-    const splitByLocalDay = (startMs: number, endMs: number) => {
-      const segments: { key: string; startMs: number; endMs: number }[] = [];
-      let cursor = startMs;
-      while (cursor < endMs) {
-        const cursorDate = new Date(cursor);
-        const nextDayStart = new Date(
-          cursorDate.getFullYear(),
-          cursorDate.getMonth(),
-          cursorDate.getDate() + 1
-        ).getTime();
-        const segmentEnd = Math.min(endMs, nextDayStart);
-        segments.push({ key: dayKey(cursorDate), startMs: cursor, endMs: segmentEnd });
-        cursor = segmentEnd;
-      }
-      return segments;
-    };
+    const sessions = sessionsRes.data || [];
+    const activeStates = activeRes.data || [];
 
-    const byUser = new Map<string, {
-      userId: string;
-      username: string;
-      userTag: string;
-      avatarUrl: string;
-      voiceSeconds: number;
-      videoSeconds: number;
-      streamSeconds: number;
-      sessionCount: number;
-      // One bucket per calendar day the member had voice activity, used to
-      // derive login time (first join), logout time (last leave), and
-      // break/lunch time (gaps between voice sessions within that span).
-      days: Map<string, { loginMs: number; logoutMs: number; voiceSeconds: number }>;
-    }>();
-
-    for (const s of data || []) {
-      let entry = byUser.get(s.user_id);
-      if (!entry) {
-        entry = {
-          userId: s.user_id,
-          username: s.username,
-          userTag: s.user_tag,
-          avatarUrl: s.avatar_url,
-          voiceSeconds: 0,
-          videoSeconds: 0,
-          streamSeconds: 0,
-          sessionCount: 0,
-          days: new Map(),
-        };
-        byUser.set(s.user_id, entry);
-      }
-      entry.sessionCount += 1;
-      if (s.activity_type === 'voice') entry.voiceSeconds += s.duration_seconds;
-      else if (s.activity_type === 'video') entry.videoSeconds += s.duration_seconds;
-      else if (s.activity_type === 'stream') entry.streamSeconds += s.duration_seconds;
-
-      if (s.activity_type === 'voice') {
-        const startMs = new Date(s.start_time).getTime();
-        const endMs = new Date(s.end_time).getTime();
-        for (const seg of splitByLocalDay(startMs, endMs)) {
-          const segSeconds = (seg.endMs - seg.startMs) / 1000;
-          const day = entry.days.get(seg.key);
-          if (!day) {
-            entry.days.set(seg.key, { loginMs: seg.startMs, logoutMs: seg.endMs, voiceSeconds: segSeconds });
-          } else {
-            day.loginMs = Math.min(day.loginMs, seg.startMs);
-            day.logoutMs = Math.max(day.logoutMs, seg.endMs);
-            day.voiceSeconds += segSeconds;
-          }
-        }
+    // Identity for requested members that had no activity at all in the window.
+    let members: any[] = [];
+    if (params.userIds && params.userIds.length > 0) {
+      const seen = new Set<string>([
+        ...sessions.map((s: any) => s.user_id),
+        ...activeStates.map((a: any) => a.user_id),
+      ]);
+      const missing = params.userIds.filter((id) => !seen.has(id));
+      if (missing.length > 0) {
+        const { data } = await supabase.from('guild_members').select('*').in('user_id', missing);
+        members = data || [];
       }
     }
 
-    // Ensure every requested member appears in the report even with zero activity
-    if (params.userIds) {
-      for (const userId of params.userIds) {
-        if (!byUser.has(userId)) {
-          const { data: member } = await supabase
-            .from('guild_members')
-            .select('*')
-            .eq('user_id', userId)
-            .maybeSingle();
-          byUser.set(userId, {
-            userId,
-            username: member?.username || 'Unknown',
-            userTag: member?.user_tag || 'unknown',
-            avatarUrl: member?.avatar_url || '',
-            voiceSeconds: 0,
-            videoSeconds: 0,
-            streamSeconds: 0,
-            sessionCount: 0,
-            days: new Map(),
-          });
-        }
-      }
-    }
-
-    const round2 = (n: number) => Math.round(n * 100) / 100;
-    const formatTimeOfDay = (minutesOfDay: number) => {
-      const h = Math.floor(minutesOfDay / 60);
-      const m = Math.round(minutesOfDay % 60);
-      return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-    };
-
-    const results = Array.from(byUser.values()).map((entry) => {
-      const voiceHours = round2(entry.voiceSeconds / 3600);
-      const videoHours = round2(entry.videoSeconds / 3600);
-      const streamHours = round2(entry.streamSeconds / 3600);
-      const streamPercentOfTarget = round2((streamHours / TARGET_HOURS) * 100);
-      const paidFull = streamHours >= REQUIRED_STREAM_HOURS;
-
-      const dayBuckets = Array.from(entry.days.values());
-      const daysActive = dayBuckets.length;
-      let totalSpanSeconds = 0;
-      let totalBreakSeconds = 0;
-      let loginMinutesSum = 0;
-      let logoutMinutesSum = 0;
-
-      for (const d of dayBuckets) {
-        const spanSeconds = Math.max(0, (d.logoutMs - d.loginMs) / 1000);
-        totalSpanSeconds += spanSeconds;
-        // Time within their logged-in span that wasn't spent in voice at all
-        // (e.g. they left for lunch and came back before logging out).
-        totalBreakSeconds += Math.max(0, spanSeconds - d.voiceSeconds);
-
-        const loginDate = new Date(d.loginMs);
-        const logoutDate = new Date(d.logoutMs);
-        loginMinutesSum += loginDate.getHours() * 60 + loginDate.getMinutes();
-        logoutMinutesSum += logoutDate.getHours() * 60 + logoutDate.getMinutes();
-      }
-
-      // Total logged-in time (login to logout, across every active day) —
-      // the headline number to compare against the monthly 160hr target.
-      const totalHours = round2(totalSpanSeconds / 3600);
-      const totalHoursPercentOfTarget = round2((totalHours / TARGET_HOURS) * 100);
-      const breakHours = round2(totalBreakSeconds / 3600);
-      const avgLoginTime = daysActive > 0 ? formatTimeOfDay(loginMinutesSum / daysActive) : null;
-      const avgLogoutTime = daysActive > 0 ? formatTimeOfDay(logoutMinutesSum / daysActive) : null;
-
-      return {
-        userId: entry.userId,
-        username: entry.username,
-        userTag: entry.userTag,
-        avatarUrl: entry.avatarUrl,
-        sessionCount: entry.sessionCount,
-        voiceHours,
-        videoHours,
-        streamHours,
-        streamPercentOfTarget,
-        paidFull,
-        daysActive,
-        avgLoginTime,
-        avgLogoutTime,
-        breakHours,
-        totalHours,
-        totalHoursPercentOfTarget,
-      };
-    });
-
-    results.sort((a, b) => b.streamHours - a.streamHours);
-
-    return {
+    return buildAttendanceReport({
+      sessions,
+      activeStates,
+      members,
+      userIds: params.userIds,
       startDate: params.startDate,
       endDate: params.endDate,
-      targetHours: TARGET_HOURS,
-      requiredStreamHours: REQUIRED_STREAM_HOURS,
-      requiredStreamPercent: REQUIRED_STREAM_PCT * 100,
-      results,
-    };
+      config,
+    });
   }
 
   public async getUserStats(userId: string, timeframe: 'all' | 'daily' | 'weekly' | 'monthly' = 'all') {

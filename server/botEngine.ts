@@ -28,6 +28,26 @@ export class BotEngine {
   private autoAlertStream = true;
   private autoAlertVideo = true;
 
+  // Voice-state updates for the same user must be processed strictly in order.
+  // Discord can deliver a join and a leave milliseconds apart (connection
+  // flaps); if both handlers run concurrently, the leave reads "no active
+  // state" before the join has written one, does nothing, and the join then
+  // leaves a ghost row behind that shows the member as online forever.
+  private userQueues = new Map<string, Promise<void>>();
+
+  public handleVoiceStateUpdate(oldState: VoiceStateSnapshot, newState: VoiceStateSnapshot): Promise<void> {
+    const userId = newState.userId || oldState.userId;
+    const previous = this.userQueues.get(userId) || Promise.resolve();
+    const run = previous
+      .catch(() => undefined)
+      .then(() => this.processVoiceStateUpdate(oldState, newState));
+    this.userQueues.set(userId, run);
+    run.finally(() => {
+      if (this.userQueues.get(userId) === run) this.userQueues.delete(userId);
+    }).catch(() => undefined);
+    return run;
+  }
+
   // Format seconds to human string (e.g., "2h 15m 30s")
   public formatDuration(totalSeconds: number): string {
     if (totalSeconds < 60) return `${Math.round(totalSeconds)}s`;
@@ -42,8 +62,9 @@ export class BotEngine {
     return parts.join(' ');
   }
 
-  // Core Voice State Handler (Used by both Discord Gateway and Simulator)
-  public async handleVoiceStateUpdate(
+  // Core Voice State Handler (Used by both Discord Gateway and Simulator).
+  // Always invoked through handleVoiceStateUpdate's per-user queue.
+  private async processVoiceStateUpdate(
     oldState: VoiceStateSnapshot,
     newState: VoiceStateSnapshot
   ) {
@@ -85,7 +106,7 @@ export class BotEngine {
         // Finalize video if active
         if (currentActive.isVideo && currentActive.videoStartTime) {
           const dur = Math.max(1, Math.floor((now - currentActive.videoStartTime) / 1000));
-          db.addCompletedSession({
+          await db.addCompletedSession({
             id: `sess-${userId}-vid-${now}`,
             userId,
             username,
@@ -105,7 +126,7 @@ export class BotEngine {
         // Finalize stream if active
         if (currentActive.isStreaming && currentActive.streamStartTime) {
           const dur = Math.max(1, Math.floor((now - currentActive.streamStartTime) / 1000));
-          db.addCompletedSession({
+          await db.addCompletedSession({
             id: `sess-${userId}-str-${now}`,
             userId,
             username,
@@ -141,8 +162,10 @@ export class BotEngine {
           durationFormatted: sessionDuration,
         });
 
-        await db.removeActiveState(userId);
       }
+      // Always clear the row, even when no active state was found, so a leave
+      // can never leave a stale "online" entry behind.
+      await db.removeActiveState(userId);
       return;
     }
 
@@ -248,7 +271,7 @@ export class BotEngine {
         // Finalize video if active
         if (currentActive.isVideo && currentActive.videoStartTime) {
           const dur = Math.max(1, Math.floor((now - currentActive.videoStartTime) / 1000));
-          db.addCompletedSession({
+          await db.addCompletedSession({
             id: `sess-${userId}-vid-${now}`,
             userId,
             username,
@@ -268,7 +291,7 @@ export class BotEngine {
         // Finalize stream if active
         if (currentActive.isStreaming && currentActive.streamStartTime) {
           const dur = Math.max(1, Math.floor((now - currentActive.streamStartTime) / 1000));
-          db.addCompletedSession({
+          await db.addCompletedSession({
             id: `sess-${userId}-str-${now}`,
             userId,
             username,

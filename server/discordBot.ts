@@ -1,11 +1,16 @@
-import { Client, GatewayIntentBits, Events, REST, Routes, SlashCommandBuilder, TextChannel, EmbedBuilder } from 'discord.js';
-import { botEngine } from './botEngine';
+import { Client, GatewayIntentBits, Events, EmbedBuilder, Guild, VoiceState } from 'discord.js';
+import { botEngine, VoiceStateSnapshot } from './botEngine';
 import { db } from './db';
 
 let discordClient: Client | null = null;
 let isConnected = false;
 let botUserTag = 'TrackerBot#0000';
 let guildCount = 0;
+let reconcileTimer: NodeJS.Timeout | null = null;
+let reconcileRunning = false;
+
+// How often tracked state is compared against Discord's live voice cache.
+const RECONCILE_INTERVAL_MS = Number(process.env.RECONCILE_INTERVAL_MS) || 2 * 60 * 1000;
 
 export function getDiscordStatus() {
   return {
@@ -31,6 +36,137 @@ export async function sendReminderDM(userId: string, message: string) {
   }
 }
 
+function snapshotFromVoiceState(
+  vs: VoiceState,
+  identity: { userId: string; username: string; userTag: string; avatarUrl: string },
+  guild: Guild,
+  channelName?: string
+): VoiceStateSnapshot {
+  return {
+    ...identity,
+    guildId: guild.id,
+    guildName: guild.name,
+    channelId: vs.channelId,
+    channelName: channelName ?? vs.channel?.name,
+    selfMute: !!vs.selfMute,
+    selfDeaf: !!vs.selfDeaf,
+    selfVideo: !!vs.selfVideo,
+    streaming: !!vs.streaming,
+  };
+}
+
+// Brings the tracked active_states for a guild in line with who is actually in
+// voice right now, without wiping anyone's in-progress session:
+//  - tracked but no longer in voice  -> synthetic leave (session gets saved)
+//  - in voice but not tracked        -> synthetic join
+//  - in voice and tracked            -> keep the original start time, but sync
+//                                       camera/stream flags if they changed
+// Runs at startup, after every gateway resume, and on a timer, so a missed or
+// dropped event can never leave a member shown as online for the rest of the day.
+async function reconcileGuild(guild: Guild, reason: string) {
+  const tracked = (await db.getAllActiveStates()).filter((s) => s.guildId === guild.id);
+  const trackedById = new Map(tracked.map((s) => [s.userId, s]));
+
+  const live = new Map<string, VoiceState>();
+  for (const vs of guild.voiceStates.cache.values()) {
+    if (vs.channelId) live.set(vs.id, vs);
+  }
+
+  let fixedGhosts = 0;
+  let addedMissing = 0;
+  let syncedFlags = 0;
+
+  for (const state of tracked) {
+    const vs = live.get(state.userId);
+    const identity = { userId: state.userId, username: state.username, userTag: state.userTag, avatarUrl: state.avatarUrl };
+
+    if (!vs) {
+      fixedGhosts++;
+      console.warn(`[Reconcile:${reason}] ${state.username} is tracked in ${state.channelName} but not in voice — finalizing session`);
+      await botEngine.handleVoiceStateUpdate(
+        { ...identity, guildId: guild.id, guildName: guild.name, channelId: state.channelId, channelName: state.channelName },
+        { ...identity, guildId: guild.id, guildName: guild.name, channelId: null }
+      );
+      continue;
+    }
+
+    const liveChannelId = vs.channelId as string;
+    const liveVideo = !!vs.selfVideo;
+    const liveStreaming = !!vs.streaming;
+    if (liveChannelId !== state.channelId || liveVideo !== state.isVideo || liveStreaming !== state.isStreaming) {
+      syncedFlags++;
+      const channel = vs.channel || (await guild.channels.fetch(liveChannelId).catch(() => null));
+      await botEngine.handleVoiceStateUpdate(
+        {
+          ...identity,
+          guildId: guild.id,
+          guildName: guild.name,
+          channelId: state.channelId,
+          channelName: state.channelName,
+          selfVideo: state.isVideo,
+          streaming: state.isStreaming,
+          selfMute: state.selfMute,
+          selfDeaf: state.selfDeaf,
+        },
+        snapshotFromVoiceState(vs, identity, guild, channel?.name)
+      );
+    }
+  }
+
+  for (const [userId, vs] of live) {
+    if (trackedById.has(userId)) continue;
+    let member = vs.member;
+    if (!member) member = await guild.members.fetch(userId).catch(() => null);
+    if (!member || member.user.bot) continue;
+    const channel = vs.channel || (await guild.channels.fetch(vs.channelId as string).catch(() => null));
+    if (!channel) continue;
+
+    addedMissing++;
+    const identity = {
+      userId: member.id,
+      username: member.user.username,
+      userTag: member.user.tag,
+      avatarUrl: member.user.displayAvatarURL(),
+    };
+    await db.addChannel(channel.id, channel.name);
+    await botEngine.handleVoiceStateUpdate(
+      { ...identity, guildId: guild.id, guildName: guild.name, channelId: null },
+      snapshotFromVoiceState(vs, identity, guild, channel.name)
+    );
+  }
+
+  if (fixedGhosts || addedMissing || syncedFlags || reason !== 'timer') {
+    console.log(
+      `[Reconcile:${reason}] ${guild.name}: ${live.size} in voice, ${tracked.length} tracked — ` +
+        `${fixedGhosts} ghosts closed, ${addedMissing} missing added, ${syncedFlags} flag syncs`
+    );
+  }
+}
+
+async function reconcileAllGuilds(reason: string) {
+  if (!discordClient || !isConnected) return;
+  if (reconcileRunning) return;
+  reconcileRunning = true;
+  try {
+    const targetGuildId = process.env.DISCORD_GUILD_ID;
+    const guilds = targetGuildId
+      ? discordClient.guilds.cache.filter((g) => g.id === targetGuildId)
+      : discordClient.guilds.cache;
+
+    if (targetGuildId && guilds.size === 0) {
+      console.warn(`[Reconcile:${reason}] DISCORD_GUILD_ID=${targetGuildId} not found in bot guild cache. Skipping.`);
+      return;
+    }
+    for (const guild of guilds.values()) {
+      await reconcileGuild(guild, reason);
+    }
+  } catch (error) {
+    console.error(`[Reconcile:${reason}] Failed:`, error);
+  } finally {
+    reconcileRunning = false;
+  }
+}
+
 export async function initDiscordBot(token?: string) {
   const botToken = token || process.env.DISCORD_BOT_TOKEN;
   if (!botToken || botToken.trim() === '') {
@@ -38,6 +174,10 @@ export async function initDiscordBot(token?: string) {
     return;
   }
 
+  if (reconcileTimer) {
+    clearInterval(reconcileTimer);
+    reconcileTimer = null;
+  }
   if (discordClient) {
     try {
       await discordClient.destroy();
@@ -63,57 +203,25 @@ export async function initDiscordBot(token?: string) {
       guildCount = c.guilds.cache.size;
       console.log(`[Discord Bot] Logged in as ${c.user.tag}! Monitoring ${guildCount} servers.`);
 
-      // Clear stale DB state and re-sync live voice snapshot on startup.
-      // This prevents "ghost" active members when the bot was offline and missed leave events.
-      const targetGuildId = process.env.DISCORD_GUILD_ID;
-      const guildsToSync = targetGuildId
-        ? c.guilds.cache.filter((g) => g.id === targetGuildId)
-        : c.guilds.cache;
+      // Sync tracked state with the live voice snapshot without discarding
+      // sessions that were in progress across the restart.
+      await reconcileAllGuilds('startup');
 
-      if (targetGuildId && guildsToSync.size === 0) {
-        console.warn(`[Discord Bot] DISCORD_GUILD_ID=${targetGuildId} not found in bot guild cache. Skipping startup sync.`);
-        return;
-      }
+      reconcileTimer = setInterval(() => {
+        reconcileAllGuilds('timer');
+      }, RECONCILE_INTERVAL_MS);
+    });
 
-      for (const guild of guildsToSync.values()) {
-        await db.clearActiveStatesForGuild(guild.id);
-
-        // Voice states cache is the most direct way to identify who is currently connected.
-        for (const voiceState of guild.voiceStates.cache.values()) {
-          if (!voiceState.channelId) continue;
-
-          const channel =
-            voiceState.channel ||
-            (await guild.channels.fetch(voiceState.channelId).catch(() => null));
-          if (!channel) continue;
-
-          let member = voiceState.member;
-          if (!member) {
-            member = await guild.members.fetch(voiceState.id).catch(() => null);
-          }
-          if (!member || member.user.bot) continue;
-
-          const now = Date.now();
-          await db.addChannel(channel.id, channel.name);
-          await db.setActiveState({
-            userId: member.id,
-            username: member.user.username,
-            userTag: member.user.tag,
-            avatarUrl: member.user.displayAvatarURL(),
-            channelId: channel.id,
-            channelName: channel.name,
-            guildId: guild.id,
-            isVoice: true,
-            isVideo: !!voiceState.selfVideo,
-            isStreaming: !!voiceState.streaming,
-            selfMute: !!voiceState.selfMute,
-            selfDeaf: !!voiceState.selfDeaf,
-            voiceStartTime: now,
-            videoStartTime: voiceState.selfVideo ? now : null,
-            streamStartTime: voiceState.streaming ? now : null,
-          });
-        }
-      }
+    // A resumed gateway session may have dropped events while disconnected.
+    discordClient.on(Events.ShardResume, () => {
+      console.log('[Discord Bot] Gateway session resumed — reconciling voice states');
+      reconcileAllGuilds('resume');
+    });
+    discordClient.on(Events.ShardDisconnect, (event) => {
+      console.warn(`[Discord Bot] Gateway disconnected (code ${event.code})`);
+    });
+    discordClient.on(Events.Error, (error) => {
+      console.error('[Discord Bot] Client error:', error);
     });
 
     discordClient.on(Events.VoiceStateUpdate, async (oldState, newState) => {
@@ -137,43 +245,19 @@ export async function initDiscordBot(token?: string) {
         return;
       }
 
-      const userTag = member?.user?.tag || 'unknown#0000';
-      const avatarUrl = member?.user ? member.user.displayAvatarURL() : '';
-      const guildId = guild.id;
-      const guildName = guild.name;
+      const identity = {
+        userId,
+        username,
+        userTag: member?.user?.tag || 'unknown#0000',
+        avatarUrl: member?.user ? member.user.displayAvatarURL() : '',
+      };
 
       try {
         await botEngine.handleVoiceStateUpdate(
-        {
-          userId,
-          username,
-          userTag,
-          avatarUrl,
-          guildId,
-          guildName,
-          channelId: oldState.channelId,
-          channelName: oldState.channel?.name,
-          selfMute: !!oldState.selfMute,
-          selfDeaf: !!oldState.selfDeaf,
-          selfVideo: !!oldState.selfVideo,
-          streaming: !!oldState.streaming,
-        },
-        {
-          userId,
-          username,
-          userTag,
-          avatarUrl,
-          guildId,
-          guildName,
-          channelId: newState.channelId,
-          channelName: newState.channel?.name,
-          selfMute: !!newState.selfMute,
-          selfDeaf: !!newState.selfDeaf,
-          selfVideo: !!newState.selfVideo,
-          streaming: !!newState.streaming,
-        }
-      );
-      console.log(`[VoiceStateUpdate] Processed ${username} successfully`);
+          snapshotFromVoiceState(oldState, identity, guild),
+          snapshotFromVoiceState(newState, identity, guild)
+        );
+        console.log(`[VoiceStateUpdate] Processed ${username} successfully`);
       } catch (error) {
         console.error(`[VoiceStateUpdate] Error processing ${username}:`, error);
       }
@@ -199,7 +283,7 @@ export async function initDiscordBot(token?: string) {
         const timeframe = (interaction.options.getString('timeframe') as any) || 'all';
         const res = await botEngine.executeStatsCommand(targetUser.id, timeframe);
         const embed = res.embeds[0];
-        
+
         const discordEmbed = new EmbedBuilder()
           .setTitle(embed.title || '')
           .setDescription(embed.description || '')

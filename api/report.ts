@@ -1,10 +1,12 @@
+import { buildAttendanceReport, configFromEnv, resolveRange } from '../server/attendance';
+
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
   try {
-    const { getReport } = await import('./_db.js');
+    const { fetchReportInputs } = await import('./_db.js');
     const { userIds, startDate, endDate } = req.body || {};
 
     if (!startDate || !endDate) {
@@ -12,10 +14,22 @@ export default async function handler(req: any, res: any) {
       return;
     }
 
-    const report = await getReport({
-      userIds: Array.isArray(userIds) && userIds.length > 0 ? userIds : undefined,
+    const config = configFromEnv();
+    const range = resolveRange(String(startDate), String(endDate), config.timezone);
+    const ids = Array.isArray(userIds) && userIds.length > 0 ? userIds.map(String) : undefined;
+
+    const inputs = await fetchReportInputs({
+      userIds: ids,
+      rangeStartIso: new Date(range.startMs).toISOString(),
+      rangeEndIso: new Date(range.endMs).toISOString(),
+    });
+
+    const report = buildAttendanceReport({
+      ...inputs,
+      userIds: ids,
       startDate: String(startDate),
       endDate: String(endDate),
+      config,
     });
 
     res.status(200).json(report);
