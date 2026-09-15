@@ -8,6 +8,7 @@ import { initDiscordBot, getDiscordStatus, sendReminderDM } from './server/disco
 import {
   captureStats,
   checkToken,
+  deleteCapture,
   findCapture,
   isConfigured as captureConfigured,
   listCaptures,
@@ -15,6 +16,7 @@ import {
   saveCapture,
   shouldCapture,
 } from './server/capture';
+import { runStreamCheck } from './server/discordBot';
 
 dotenv.config();
 
@@ -42,6 +44,7 @@ async function startServer() {
       mode: discordInfo.isConnected ? 'live' : 'simulation',
       discordConnected: discordInfo.isConnected,
       botTag: discordInfo.botTag,
+      guildId: discordInfo.guildId,
       guildCount: discordInfo.guildCount,
       activeVoiceCount: overview.activeVoiceCount,
       activeVideoCount: overview.activeVideoCount,
@@ -69,6 +72,7 @@ async function startServer() {
         mode: discordInfo.isConnected ? 'live' : 'simulation',
         discordConnected: discordInfo.isConnected,
         botTag: discordInfo.botTag,
+        guildId: discordInfo.guildId,
         guildCount: discordInfo.guildCount,
         activeVoiceCount: overview.activeVoiceCount,
         activeVideoCount: overview.activeVideoCount,
@@ -221,6 +225,56 @@ async function startServer() {
       }
     }
   );
+
+  // Manual upload from the dashboard: a manager watches a rep's stream in
+  // Discord, screenshots it, and drops the image here. Needs nothing installed
+  // on the rep's machine. Same gallery, tagged source:'manual'.
+  app.post(
+    '/api/capture/manual',
+    express.raw({ type: ['image/png', 'image/jpeg', 'application/octet-stream'], limit: '10mb' }),
+    async (req, res) => {
+      const userId = String(req.query.userId || '');
+      if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+      try {
+        const [active, members] = await Promise.all([
+          db.getActiveState(userId),
+          db.getGuildMembers(),
+        ]);
+        const member = members.find((m) => m.userId === userId);
+        const record = saveCapture({
+          userId,
+          username: active?.username || member?.username || String(req.query.username || 'Unknown'),
+          channelName: active?.channelName || null,
+          agentHost: null,
+          agentPlatform: null,
+          source: 'manual',
+          note: req.query.note ? String(req.query.note).slice(0, 200) : null,
+          image: req.body as Buffer,
+        });
+        console.log(`[Capture] Manual upload ${record.id} (${record.bytes} bytes) for ${record.username}`);
+        res.json({ ok: true, id: record.id, takenAtLocal: record.takenAtLocal });
+      } catch (e: any) {
+        console.error('[Capture] Manual upload failed:', e);
+        res.status(400).json({ error: e.message || 'Failed to store screenshot' });
+      }
+    }
+  );
+
+  app.delete('/api/capture/:id', (req, res) => {
+    const ok = deleteCapture(String(req.params.id));
+    if (!ok) return res.status(404).json({ error: 'Capture not found' });
+    res.json({ ok: true });
+  });
+
+  // Daily stream check, on demand.
+  app.post('/api/stream-check/run', async (req, res) => {
+    const result = await runStreamCheck('manual', req.body?.post !== false);
+    if (!result) {
+      return res.status(503).json({ error: 'Bot is not connected — cannot read live voice state.' });
+    }
+    res.json(result);
+  });
 
   // Dashboard: list capture metadata and stream a stored image.
   app.get('/api/capture/list', (req, res) => {

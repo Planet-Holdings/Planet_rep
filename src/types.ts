@@ -114,6 +114,7 @@ export interface BotStatusConfig {
   mode: 'simulation' | 'live';
   discordConnected: boolean;
   botTag: string;
+  guildId?: string;
   guildCount: number;
   activeVoiceCount: number;
   activeVideoCount: number;

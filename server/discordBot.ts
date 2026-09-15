@@ -1,6 +1,7 @@
-import { Client, GatewayIntentBits, Events, EmbedBuilder, Guild, VoiceState } from 'discord.js';
+import { Client, GatewayIntentBits, Events, EmbedBuilder, Guild, VoiceState, TextChannel } from 'discord.js';
 import { botEngine, VoiceStateSnapshot } from './botEngine';
 import { db } from './db';
+import { buildStreamCheck, renderStreamCheckEmbed, nextRunAt, StreamCheckResult } from './streamCheck';
 
 let discordClient: Client | null = null;
 let isConnected = false;
@@ -8,15 +9,22 @@ let botUserTag = 'TrackerBot#0000';
 let guildCount = 0;
 let reconcileTimer: NodeJS.Timeout | null = null;
 let reconcileRunning = false;
+let streamCheckTimer: NodeJS.Timeout | null = null;
 
 // How often tracked state is compared against Discord's live voice cache.
 const RECONCILE_INTERVAL_MS = Number(process.env.RECONCILE_INTERVAL_MS) || 2 * 60 * 1000;
+// Daily stream check: what time (office timezone) the bot posts who is live.
+const STREAM_CHECK_TIME = process.env.STREAM_CHECK_TIME || '11:00';
+const STREAM_CHECK_ENABLED = (process.env.STREAM_CHECK_ENABLED || 'true') !== 'false';
+const STREAM_CHECK_WEEKENDS = process.env.STREAM_CHECK_WEEKENDS === 'true';
 
 export function getDiscordStatus() {
   return {
     isConnected,
     botTag: botUserTag,
     guildCount,
+    // Used by the dashboard to build discord.com/channels/<guild>/<channel> links.
+    guildId: process.env.DISCORD_GUILD_ID || discordClient?.guilds.cache.first()?.id || null,
   };
 }
 
@@ -167,6 +175,83 @@ async function reconcileAllGuilds(reason: string) {
   }
 }
 
+// Builds the "who is live right now" summary and optionally posts it to the
+// log channel. Returns null when the bot isn't connected, since without the
+// gateway there is no live voice state to report.
+export async function runStreamCheck(
+  reason: string,
+  post = true
+): Promise<(StreamCheckResult & { posted: boolean; channelId: string | null }) | null> {
+  if (!discordClient || !isConnected) return null;
+
+  const guildId = process.env.DISCORD_GUILD_ID || discordClient.guilds.cache.first()?.id;
+  const [active, roster] = await Promise.all([db.getAllActiveStates(), db.getRecentRoster()]);
+  const result = buildStreamCheck({ active, roster, guildId, now: Date.now() });
+
+  const channelId = process.env.DISCORD_LOG_CHANNEL_ID || null;
+  let posted = false;
+
+  if (post && channelId) {
+    try {
+      const channel = await discordClient.channels.fetch(channelId);
+      if (channel && (channel as TextChannel).isTextBased?.()) {
+        const e = renderStreamCheckEmbed(result, guildId);
+        const embed = new EmbedBuilder()
+          .setTitle(e.title)
+          .setDescription(e.description)
+          .setColor(e.color)
+          .setFooter(e.footer)
+          .setTimestamp(new Date(e.timestamp));
+        e.fields.forEach((f) => embed.addFields({ name: f.name, value: f.value, inline: f.inline }));
+        await (channel as TextChannel).send({ embeds: [embed] });
+        posted = true;
+      } else {
+        console.warn(`[StreamCheck] Channel ${channelId} is not a text channel — nothing posted.`);
+      }
+    } catch (error) {
+      console.error('[StreamCheck] Failed to post:', error);
+    }
+  } else if (post && !channelId) {
+    console.warn('[StreamCheck] DISCORD_LOG_CHANNEL_ID is not set — nothing posted.');
+  }
+
+  console.log(
+    `[StreamCheck:${reason}] ${result.live.length} live, ${result.inVoiceNotLive.length} in voice not live, ` +
+      `${result.notOnline.length}/${result.rosterSize} not online — ${posted ? 'posted' : 'not posted'}`
+  );
+  return { ...result, posted, channelId };
+}
+
+function scheduleStreamCheck() {
+  if (streamCheckTimer) {
+    clearTimeout(streamCheckTimer);
+    streamCheckTimer = null;
+  }
+  if (!STREAM_CHECK_ENABLED) {
+    console.log('[StreamCheck] Disabled (STREAM_CHECK_ENABLED=false).');
+    return;
+  }
+
+  const now = Date.now();
+  const next = nextRunAt(now, STREAM_CHECK_TIME, STREAM_CHECK_WEEKENDS);
+  const delay = Math.max(1000, next - now);
+  console.log(
+    `[StreamCheck] Next run at ${new Date(next).toISOString()} ` +
+      `(${STREAM_CHECK_TIME} ${process.env.SCHEDULE_TZ || 'America/New_York'}, in ${Math.round(delay / 60000)} min)`
+  );
+
+  // setTimeout caps out around 24.8 days; the delay here is always under a day.
+  streamCheckTimer = setTimeout(async () => {
+    try {
+      await runStreamCheck('daily');
+    } catch (e) {
+      console.error('[StreamCheck] Daily run failed:', e);
+    } finally {
+      scheduleStreamCheck();
+    }
+  }, delay);
+}
+
 export async function initDiscordBot(token?: string) {
   const botToken = token || process.env.DISCORD_BOT_TOKEN;
   if (!botToken || botToken.trim() === '') {
@@ -210,6 +295,8 @@ export async function initDiscordBot(token?: string) {
       reconcileTimer = setInterval(() => {
         reconcileAllGuilds('timer');
       }, RECONCILE_INTERVAL_MS);
+
+      scheduleStreamCheck();
     });
 
     // A resumed gateway session may have dropped events while disconnected.

@@ -25,6 +25,8 @@ const MIN_GAP_MINUTES = Number(process.env.CAPTURE_MIN_GAP_MINUTES) || 60;
 const CAPTURES_PER_DAY = Number(process.env.CAPTURES_PER_DAY) || 1;
 const MAX_BYTES = Number(process.env.CAPTURE_MAX_BYTES) || 8 * 1024 * 1024;
 
+export type CaptureSource = 'agent' | 'manual';
+
 export interface CaptureRecord {
   id: string;
   userId: string;
@@ -34,6 +36,9 @@ export interface CaptureRecord {
   takenAtLocal: string; // HH:MM in office timezone
   channelName: string | null;
   bytes: number;
+  ext: 'png' | 'jpg';
+  source: CaptureSource;
+  note: string | null;
   agentHost: string | null;
   agentPlatform: string | null;
 }
@@ -138,9 +143,25 @@ export function findCapture(id: string): { record: CaptureRecord; file: string }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
   const record = readDay(date).find((r) => r.id === id);
   if (!record) return null;
-  const file = path.join(dayDir(date), `${id}.png`);
+  const file = path.join(dayDir(date), `${id}.${record.ext || 'png'}`);
   if (!fs.existsSync(file)) return null;
   return { record, file };
+}
+
+export function deleteCapture(id: string): boolean {
+  const date = id.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const records = readDay(date);
+  const idx = records.findIndex((r) => r.id === id);
+  if (idx === -1) return false;
+  const [removed] = records.splice(idx, 1);
+  try {
+    fs.rmSync(path.join(dayDir(date), `${id}.${removed.ext || 'png'}`), { force: true });
+  } catch (e) {
+    console.error('[Capture] Failed to remove image file:', e);
+  }
+  writeDay(date, records);
+  return true;
 }
 
 // Decides whether the agent on this member's machine should capture now.
@@ -151,7 +172,9 @@ export function shouldCapture(params: {
 }): { capture: boolean; reason: string; takenToday: number } {
   const now = params.now ?? Date.now();
   const date = todayKey(now);
-  const mine = readDay(date).filter((r) => r.userId === params.userId);
+  // Manual uploads by a manager don't satisfy the agent's daily quota — the
+  // two are independent ways of getting an image for the same person.
+  const mine = readDay(date).filter((r) => r.userId === params.userId && r.source !== 'manual');
 
   if (!params.isStreaming) {
     return { capture: false, reason: 'not_streaming', takenToday: mine.length };
@@ -166,6 +189,17 @@ export function shouldCapture(params: {
   return { capture: true, reason: 'streaming', takenToday: mine.length };
 }
 
+// Returns the image kind from its magic number, or null if it is neither.
+function detectImage(buf: Buffer): 'png' | 'jpg' | null {
+  if (buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return 'png';
+  }
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return 'jpg';
+  }
+  return null;
+}
+
 export function saveCapture(params: {
   userId: string;
   username: string;
@@ -173,6 +207,8 @@ export function saveCapture(params: {
   agentHost: string | null;
   agentPlatform: string | null;
   image: Buffer;
+  source?: CaptureSource;
+  note?: string | null;
   now?: number;
 }): CaptureRecord {
   if (!params.image || params.image.length === 0) {
@@ -181,21 +217,15 @@ export function saveCapture(params: {
   if (params.image.length > MAX_BYTES) {
     throw new Error(`Image too large (${params.image.length} bytes, max ${MAX_BYTES})`);
   }
-  // PNG magic number — reject anything that isn't actually a PNG.
-  const isPng =
-    params.image.length > 8 &&
-    params.image[0] === 0x89 &&
-    params.image[1] === 0x50 &&
-    params.image[2] === 0x4e &&
-    params.image[3] === 0x47;
-  if (!isPng) throw new Error('Body must be a PNG image');
+  const ext = detectImage(params.image);
+  if (!ext) throw new Error('File must be a PNG or JPEG image');
 
   const now = params.now ?? Date.now();
   const date = todayKey(now);
   const id = `${date}_${params.userId}_${now}`;
 
   ensureDir(dayDir(date));
-  fs.writeFileSync(path.join(dayDir(date), `${id}.png`), params.image);
+  fs.writeFileSync(path.join(dayDir(date), `${id}.${ext}`), params.image);
 
   const record: CaptureRecord = {
     id,
@@ -206,6 +236,9 @@ export function saveCapture(params: {
     takenAtLocal: localHhmm(now),
     channelName: params.channelName,
     bytes: params.image.length,
+    ext,
+    source: params.source || 'agent',
+    note: params.note || null,
     agentHost: params.agentHost,
     agentPlatform: params.agentPlatform,
   };

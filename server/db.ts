@@ -569,6 +569,32 @@ class DatabaseManager {
     });
   }
 
+  // Members who actually worked recently — the roster the daily stream check
+  // measures against. Using every guild member would drag in admins, bots'
+  // owners and long-gone accounts, so this is derived from real voice activity.
+  public async getRecentRoster(days = 14): Promise<{ userId: string; username: string }[]> {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+    let query = supabase
+      .from('sessions')
+      .select('user_id,username,start_time')
+      .gte('start_time', since);
+
+    const guildIdFilter = process.env.DISCORD_GUILD_ID;
+    if (guildIdFilter) query = query.eq('guild_id', guildIdFilter);
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('[Supabase] getRecentRoster error:', error);
+      return [];
+    }
+
+    const byUser = new Map<string, string>();
+    for (const s of data || []) {
+      byUser.set((s as any).user_id, (s as any).username);
+    }
+    return Array.from(byUser, ([userId, username]) => ({ userId, username }));
+  }
+
   public async getUserStats(userId: string, timeframe: 'all' | 'daily' | 'weekly' | 'monthly' = 'all') {
     const now = new Date();
     let minDate: Date | null = null;

@@ -58,7 +58,12 @@ export default function App() {
   }, [refreshAllData]);
 
   useEffect(() => {
-    const shouldLoadMembers = activeTab === 'members' || activeTab === 'inactive' || activeTab === 'commands' || activeTab === 'reports';
+    const shouldLoadMembers =
+      activeTab === 'members' ||
+      activeTab === 'inactive' ||
+      activeTab === 'commands' ||
+      activeTab === 'reports' ||
+      activeTab === 'screenshots';
     if (!shouldLoadMembers) return;
 
     const isStale = !membersLoadedAt || Date.now() - membersLoadedAt > 60_000;
@@ -147,7 +152,7 @@ export default function App() {
         )}
 
         {activeTab === 'screenshots' && (
-          <ScreenshotsTab />
+          <ScreenshotsTab members={allMembers} guildId={status?.guildId} />
         )}
 
         {activeTab === 'inactive' && (
