@@ -10,7 +10,8 @@ import {
   Terminal,
   Activity,
   Sparkles,
-  ClipboardList
+  ClipboardList,
+  Camera
 } from 'lucide-react';
 import { BotStatusConfig } from '../types';
 
@@ -33,8 +34,9 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'members', label: '03. Member Stats', icon: Users },
     { id: 'sessions', label: '04. Session History', icon: History },
     { id: 'reports', label: '05. Reports', icon: ClipboardList },
-    { id: 'inactive', label: '06. Inactive Audit', icon: Moon },
-    { id: 'commands', label: '07. Slash Commands', icon: Terminal },
+    { id: 'screenshots', label: '06. Screenshots', icon: Camera },
+    { id: 'inactive', label: '07. Inactive Audit', icon: Moon },
+    { id: 'commands', label: '08. Slash Commands', icon: Terminal },
   ];
 
   return (

@@ -5,6 +5,7 @@ import { LiveChannelsTab } from './components/LiveChannelsTab';
 import { MembersStatsTab } from './components/MembersStatsTab';
 import { SessionHistoryTab } from './components/SessionHistoryTab';
 import { ReportsTab } from './components/ReportsTab';
+import { ScreenshotsTab } from './components/ScreenshotsTab';
 import { InactiveTab } from './components/InactiveTab';
 import { SlashCommandsTab } from './components/SlashCommandsTab';
 import {
@@ -143,6 +144,10 @@ export default function App() {
 
         {activeTab === 'reports' && (
           <ReportsTab members={allMembers} />
+        )}
+
+        {activeTab === 'screenshots' && (
+          <ScreenshotsTab />
         )}
 
         {activeTab === 'inactive' && (

@@ -5,6 +5,16 @@ import { createServer as createViteServer } from 'vite';
 import { db } from './server/db';
 import { botEngine } from './server/botEngine';
 import { initDiscordBot, getDiscordStatus, sendReminderDM } from './server/discordBot';
+import {
+  captureStats,
+  checkToken,
+  findCapture,
+  isConfigured as captureConfigured,
+  listCaptures,
+  pruneOldCaptures,
+  saveCapture,
+  shouldCapture,
+} from './server/capture';
 
 dotenv.config();
 
@@ -156,6 +166,81 @@ async function startServer() {
     }
   });
 
+  // --- Workstation screenshot capture ---
+  // The agent on a rep's machine polls this; the server only says "capture"
+  // while that member is actually screen-sharing right now, so the image
+  // always shows what they were streaming.
+  app.get('/api/capture/should', async (req, res) => {
+    if (!captureConfigured()) {
+      return res.status(503).json({ error: 'Capture is not configured (CAPTURE_TOKEN unset)' });
+    }
+    if (!checkToken(String(req.query.token || req.get('x-capture-token') || ''))) {
+      return res.status(401).json({ error: 'Invalid capture token' });
+    }
+    const userId = String(req.query.userId || '');
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    const active = await db.getActiveState(userId);
+    const decision = shouldCapture({ userId, isStreaming: !!active?.isStreaming });
+    res.json({
+      ...decision,
+      username: active?.username || null,
+      channelName: active?.channelName || null,
+      pollSeconds: Number(process.env.CAPTURE_POLL_SECONDS) || 300,
+    });
+  });
+
+  app.post(
+    '/api/capture',
+    express.raw({ type: ['image/png', 'application/octet-stream'], limit: '10mb' }),
+    async (req, res) => {
+      if (!captureConfigured()) {
+        return res.status(503).json({ error: 'Capture is not configured (CAPTURE_TOKEN unset)' });
+      }
+      if (!checkToken(String(req.query.token || req.get('x-capture-token') || ''))) {
+        return res.status(401).json({ error: 'Invalid capture token' });
+      }
+      const userId = String(req.query.userId || '');
+      if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+      try {
+        const active = await db.getActiveState(userId);
+        const record = saveCapture({
+          userId,
+          username: active?.username || String(req.query.username || '') || 'Unknown',
+          channelName: active?.channelName || null,
+          agentHost: (req.query.host as string) || null,
+          agentPlatform: (req.query.platform as string) || null,
+          image: req.body as Buffer,
+        });
+        console.log(`[Capture] Stored ${record.id} (${record.bytes} bytes) for ${record.username}`);
+        res.json({ ok: true, id: record.id, takenAtLocal: record.takenAtLocal });
+      } catch (e: any) {
+        console.error('[Capture] Save failed:', e);
+        res.status(400).json({ error: e.message || 'Failed to store capture' });
+      }
+    }
+  );
+
+  // Dashboard: list capture metadata and stream a stored image.
+  app.get('/api/capture/list', (req, res) => {
+    const { date, userId, limit } = req.query;
+    const result = listCaptures({
+      date: date ? String(date) : undefined,
+      userId: userId ? String(userId) : undefined,
+      limit: limit ? parseInt(String(limit), 10) : undefined,
+    });
+    res.json({ ...result, stats: captureStats() });
+  });
+
+  app.get('/api/capture/image/:id', (req, res) => {
+    const found = findCapture(String(req.params.id));
+    if (!found) return res.status(404).json({ error: 'Capture not found' });
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    res.sendFile(found.file);
+  });
+
   // User Stats (/stats)
   app.get('/api/stats/:userId', async (req, res) => {
     const { userId } = req.params;
@@ -305,6 +390,12 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Server] Discord Voice Tracker Running on http://localhost:${PORT}`);
+    const cap = captureStats();
+    console.log(
+      `[Capture] ${cap.enabled ? 'enabled' : 'DISABLED (set CAPTURE_TOKEN)'} — ` +
+        `${cap.capturesPerDay}/day, ${cap.retentionDays}d retention, dir ${cap.directory}`
+    );
+    if (cap.enabled) pruneOldCaptures(true);
   });
 }
 
