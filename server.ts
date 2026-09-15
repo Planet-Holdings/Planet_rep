@@ -16,7 +16,7 @@ import {
   saveCapture,
   shouldCapture,
 } from './server/capture';
-import { runStreamCheck } from './server/discordBot';
+import { runStreamCheck, requestScreenshots } from './server/discordBot';
 
 dotenv.config();
 
@@ -265,6 +265,19 @@ async function startServer() {
     const ok = deleteCapture(String(req.params.id));
     if (!ok) return res.status(404).json({ error: 'Capture not found' });
     res.json({ ok: true });
+  });
+
+  // Ask everyone streaming right now to post a screenshot in Discord.
+  app.post('/api/capture/request', async (req, res) => {
+    const result = await requestScreenshots('manual');
+    if (!result) {
+      return res.status(503).json({
+        error: process.env.CAPTURE_CHANNEL_ID
+          ? 'Bot is not connected.'
+          : 'CAPTURE_CHANNEL_ID is not set — tell the server which channel reps should post screenshots in.',
+      });
+    }
+    res.json(result);
   });
 
   // Daily stream check, on demand.

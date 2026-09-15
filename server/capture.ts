@@ -25,7 +25,10 @@ const MIN_GAP_MINUTES = Number(process.env.CAPTURE_MIN_GAP_MINUTES) || 60;
 const CAPTURES_PER_DAY = Number(process.env.CAPTURES_PER_DAY) || 1;
 const MAX_BYTES = Number(process.env.CAPTURE_MAX_BYTES) || 8 * 1024 * 1024;
 
-export type CaptureSource = 'agent' | 'manual';
+// agent  = captured automatically by the workstation agent
+// discord = the rep posted a screenshot in Discord and the bot filed it
+// manual  = a manager uploaded it from the dashboard
+export type CaptureSource = 'agent' | 'discord' | 'manual';
 
 export interface CaptureRecord {
   id: string;
@@ -267,6 +270,16 @@ export function pruneOldCaptures(force = false) {
   } catch (e) {
     console.error('[Capture] Prune failed:', e);
   }
+}
+
+// Has this member produced a screenshot today by any route? Used to decide who
+// still needs to be asked in Discord.
+export function hasCaptureToday(userId: string, now = Date.now()): boolean {
+  return readDay(todayKey(now)).some((r) => r.userId === userId);
+}
+
+export function capturedTodayIds(now = Date.now()): Set<string> {
+  return new Set(readDay(todayKey(now)).map((r) => r.userId));
 }
 
 export function captureStats() {

@@ -2,6 +2,7 @@ import { Client, GatewayIntentBits, Events, EmbedBuilder, Guild, VoiceState, Tex
 import { botEngine, VoiceStateSnapshot } from './botEngine';
 import { db } from './db';
 import { buildStreamCheck, renderStreamCheckEmbed, nextRunAt, StreamCheckResult } from './streamCheck';
+import { capturedTodayIds, saveCapture } from './capture';
 
 let discordClient: Client | null = null;
 let isConnected = false;
@@ -17,6 +18,10 @@ const RECONCILE_INTERVAL_MS = Number(process.env.RECONCILE_INTERVAL_MS) || 2 * 6
 const STREAM_CHECK_TIME = process.env.STREAM_CHECK_TIME || '11:00';
 const STREAM_CHECK_ENABLED = (process.env.STREAM_CHECK_ENABLED || 'true') !== 'false';
 const STREAM_CHECK_WEEKENDS = process.env.STREAM_CHECK_WEEKENDS === 'true';
+// Channel where reps post their daily screenshot. Anything image-shaped posted
+// here (or DM'd to the bot) is filed against its author automatically.
+const CAPTURE_CHANNEL_ID = process.env.CAPTURE_CHANNEL_ID || '';
+const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
 export function getDiscordStatus() {
   return {
@@ -222,6 +227,85 @@ export async function runStreamCheck(
   return { ...result, posted, channelId };
 }
 
+// Asks everyone who is streaming right now, and hasn't produced a screenshot
+// today by any route, to post one. This is the zero-install path: the rep uses
+// their own OS screenshot key and drops the image in the channel.
+export async function requestScreenshots(reason: string): Promise<{ asked: string[]; skipped: number } | null> {
+  if (!discordClient || !isConnected) return null;
+  if (!CAPTURE_CHANNEL_ID) {
+    console.warn('[ScreenshotRequest] CAPTURE_CHANNEL_ID is not set — nobody was asked.');
+    return null;
+  }
+
+  const active = await db.getAllActiveStates();
+  const already = capturedTodayIds();
+  const streaming = active.filter((a) => a.isStreaming);
+  const toAsk = streaming.filter((a) => !already.has(a.userId));
+
+  if (toAsk.length === 0) {
+    console.log(`[ScreenshotRequest:${reason}] Nobody to ask (${streaming.length} streaming, all covered).`);
+    return { asked: [], skipped: streaming.length };
+  }
+
+  try {
+    const channel = await discordClient.channels.fetch(CAPTURE_CHANNEL_ID);
+    if (!channel || !(channel as TextChannel).isTextBased?.()) {
+      console.warn(`[ScreenshotRequest] Channel ${CAPTURE_CHANNEL_ID} is not a text channel.`);
+      return null;
+    }
+    const mentions = toAsk.map((a) => `<@${a.userId}>`).join(' ');
+    await (channel as TextChannel).send(
+      `📸 **Daily screen check** — ${mentions}\n` +
+        `Please post a screenshot of your screen in this channel now.\n` +
+        `Windows: \`Windows key + Shift + S\` · Mac: \`Cmd + Shift + 4\`, then paste it here.\n` +
+        `_Once today's screenshot is in, you won't be asked again._`
+    );
+    console.log(`[ScreenshotRequest:${reason}] Asked ${toAsk.length}, ${already.size} already covered.`);
+    return { asked: toAsk.map((a) => a.username), skipped: streaming.length - toAsk.length };
+  } catch (error) {
+    console.error('[ScreenshotRequest] Failed to post:', error);
+    return null;
+  }
+}
+
+// Files an image a rep posted in Discord into the same gallery the agent and
+// manual uploads use.
+async function handleScreenshotMessage(message: any) {
+  const attachment = [...message.attachments.values()].find((a: any) =>
+    (a.contentType || '').startsWith('image/')
+  );
+  if (!attachment) return;
+
+  if (attachment.size > MAX_ATTACHMENT_BYTES) {
+    await message.reply(`That image is too large (max ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)} MB).`).catch(() => {});
+    return;
+  }
+
+  try {
+    const res = await fetch(attachment.url);
+    if (!res.ok) throw new Error(`Discord CDN returned ${res.status}`);
+    const image = Buffer.from(await res.arrayBuffer());
+
+    const active = await db.getActiveState(message.author.id);
+    const record = saveCapture({
+      userId: message.author.id,
+      username: message.author.username,
+      channelName: active?.channelName || null,
+      agentHost: null,
+      agentPlatform: null,
+      source: 'discord',
+      note: message.content ? String(message.content).slice(0, 200) : null,
+      image,
+    });
+
+    await message.react('✅').catch(() => {});
+    console.log(`[ScreenshotRequest] Filed ${record.id} from ${message.author.username} via Discord.`);
+  } catch (error: any) {
+    console.error('[ScreenshotRequest] Could not file attachment:', error);
+    await message.reply(`Could not save that image: ${error.message || 'unknown error'}`).catch(() => {});
+  }
+}
+
 function scheduleStreamCheck() {
   if (streamCheckTimer) {
     clearTimeout(streamCheckTimer);
@@ -244,6 +328,7 @@ function scheduleStreamCheck() {
   streamCheckTimer = setTimeout(async () => {
     try {
       await runStreamCheck('daily');
+      await requestScreenshots('daily');
     } catch (e) {
       console.error('[StreamCheck] Daily run failed:', e);
     } finally {
@@ -358,6 +443,16 @@ export async function initDiscordBot(token?: string) {
           targetChannel.send(`🔴 **${streamerName}** started screen sharing in **#${newState.channel.name}**!`);
         }
       }
+    });
+
+    // Screenshots reps post themselves — in the capture channel or by DM.
+    discordClient.on(Events.MessageCreate, async (message) => {
+      if (message.author?.bot) return;
+      if (message.attachments.size === 0) return;
+      const isDM = !message.guild;
+      const inCaptureChannel = !!CAPTURE_CHANNEL_ID && message.channelId === CAPTURE_CHANNEL_ID;
+      if (!isDM && !inCaptureChannel) return;
+      await handleScreenshotMessage(message);
     });
 
     discordClient.on(Events.InteractionCreate, async (interaction) => {

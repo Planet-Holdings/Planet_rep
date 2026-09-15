@@ -22,7 +22,7 @@ interface CaptureRecord {
   channelName: string | null;
   bytes: number;
   ext: string;
-  source: 'agent' | 'manual';
+  source: 'agent' | 'discord' | 'manual';
   note: string | null;
   agentHost: string | null;
   agentPlatform: string | null;
@@ -82,6 +82,8 @@ export const ScreenshotsTab: React.FC<ScreenshotsTabProps> = ({ members, guildId
   const [streamCheck, setStreamCheck] = useState<StreamCheck | null>(null);
   const [checking, setChecking] = useState(false);
 
+  const [asking, setAsking] = useState(false);
+  const [askResult, setAskResult] = useState<string | null>(null);
   const [uploadFor, setUploadFor] = useState<string>('');
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState<string | null>(null);
@@ -132,6 +134,27 @@ export const ScreenshotsTab: React.FC<ScreenshotsTabProps> = ({ members, guildId
   useEffect(() => {
     runStreamCheck(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Bot pings everyone currently streaming to post a screenshot in Discord.
+  // Whatever they post is filed into this gallery automatically.
+  const askForScreenshots = useCallback(async () => {
+    setAsking(true);
+    setAskResult(null);
+    try {
+      const res = await fetch('/api/capture/request', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      setAskResult(
+        data.asked.length === 0
+          ? `Nobody to ask — everyone streaming already has today's screenshot.`
+          : `Asked ${data.asked.length}: ${data.asked.join(', ')}.`
+      );
+    } catch (e: any) {
+      setAskResult(e.message || 'Request failed');
+    } finally {
+      setAsking(false);
+    }
   }, []);
 
   const uploadImage = useCallback(async (file: File | Blob, userId: string) => {
@@ -221,14 +244,29 @@ export const ScreenshotsTab: React.FC<ScreenshotsTabProps> = ({ members, guildId
             <button
               onClick={() => runStreamCheck(true)}
               disabled={checking}
-              className="flex items-center gap-1.5 px-3 py-2 bg-zinc-100 hover:bg-white disabled:opacity-40 text-zinc-950 text-xs font-black uppercase tracking-wider transition-colors"
+              className="flex items-center gap-1.5 px-3 py-2 bg-zinc-950 hover:bg-zinc-800 disabled:opacity-40 text-zinc-300 text-xs font-bold uppercase tracking-wider border border-zinc-800 transition-colors"
               title="Post this list to the Discord log channel"
             >
               <Radio className="w-3.5 h-3.5" />
-              Post to Discord
+              Post List
+            </button>
+            <button
+              onClick={askForScreenshots}
+              disabled={asking}
+              className="flex items-center gap-1.5 px-3 py-2 bg-zinc-100 hover:bg-white disabled:opacity-40 text-zinc-950 text-xs font-black uppercase tracking-wider transition-colors"
+              title="Ask everyone streaming to post a screenshot in Discord now"
+            >
+              <Camera className="w-3.5 h-3.5" />
+              {asking ? 'Asking...' : 'Ask for Screenshots'}
             </button>
           </div>
         </div>
+
+        {askResult && (
+          <div className="px-5 py-2.5 bg-zinc-950/60 border-b border-zinc-800 text-[11px] font-mono text-zinc-300">
+            {askResult}
+          </div>
+        )}
 
         <div className="p-5 grid grid-cols-1 md:grid-cols-3 gap-5">
           <div>
@@ -472,9 +510,11 @@ export const ScreenshotsTab: React.FC<ScreenshotsTabProps> = ({ members, guildId
                   <span className={`inline-block px-1.5 py-0.5 text-[9px] font-bold uppercase border ${
                     c.source === 'agent'
                       ? 'bg-sky-500/10 text-sky-400 border-sky-500/30'
+                      : c.source === 'discord'
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
                       : 'bg-zinc-800 text-zinc-400 border-zinc-700'
                   }`}>
-                    {c.source === 'agent' ? 'Auto (agent)' : 'Manual'}
+                    {c.source === 'agent' ? 'Auto (agent)' : c.source === 'discord' ? 'Sent in Discord' : 'Manual'}
                   </span>
                 </div>
               </button>
