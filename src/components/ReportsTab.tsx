@@ -218,22 +218,26 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
 
   const exportSummaryCSV = () => {
     if (!report) return;
+    const win = `${report.payWindow.start}-${report.payWindow.end} ${report.timezone}`;
     const headers = [
       'User ID', 'Username', 'Days Active', 'Workdays Missed',
       `Avg Clock In (${report.timezone})`, `Avg Clock Out (${report.timezone})`,
       'Avg Late (min)', 'Late Days', 'Avg Early Leave (min)', 'Early Leave Days', 'On-Time Days',
-      'Lunch Hours', 'Break Hours', 'Worked Hours (in voice)',
-      `Total Hours (of ${report.targetHours}h target)`, '% of Target',
-      'Sessions', 'Voice Hours', 'Stream Hours', 'Video Hours',
+      'Lunch Hours', 'Break Hours',
+      `PAID Hours (${win})`, `% of ${report.targetHours}h Target`,
+      'Hours Not Counted (outside window)', 'Raw Voice Hours (window ignored)',
+      'Sessions', `PAID Stream Hours`, 'Raw Stream Hours', 'Video Hours',
       '% of Target Streamed', `Paid Full (>= ${report.requiredStreamHours}h streamed)`,
     ];
     const rows = report.results.map((r) => [
       r.userId, r.username, r.daysActive, r.workdaysMissed,
       r.avgClockIn || 'N/A', r.avgClockOut || 'N/A',
       r.avgLateMinutes, r.lateDays, r.avgEarlyLeaveMinutes, r.earlyLeaveDays, r.onTimeDays,
-      r.lunchHours, r.breakHours, r.workedHours,
-      r.totalHours, r.totalHoursPercentOfTarget,
-      r.sessionCount, r.voiceHours, r.streamHours, r.videoHours,
+      r.lunchHours, r.breakHours,
+      r.voiceHours,
+      report.targetHours > 0 ? Math.round((r.voiceHours / report.targetHours) * 1000) / 10 : 0,
+      r.outsideWindowHours, r.rawVoiceHours,
+      r.sessionCount, r.streamHours, r.rawStreamHours, r.videoHours,
       r.streamPercentOfTarget, r.paidFull ? 'YES' : 'NO',
     ]);
     downloadCsv(`payroll_summary_${rangeSlug(report)}.csv`, headers, rows);
@@ -244,7 +248,9 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
     const headers = [
       'User ID', 'Username', 'Date', 'Weekday', 'Workday',
       `Clock In (${report.timezone})`, `Clock Out (${report.timezone})`, 'Still In Voice',
-      'Lunch (min)', 'Breaks (min)', 'Worked Hours (in voice)', 'Span Hours (in to out)', 'Stream Hours',
+      'Lunch (min)', 'Breaks (min)',
+      `PAID Hours (${report.payWindow.start}-${report.payWindow.end})`,
+      'Hours Not Counted', 'Raw Hours In Voice', 'Paid Stream Hours',
       'Late (min)', 'Early Leave (min)', 'Status',
     ];
     const rows: (string | number)[][] = [];
@@ -253,7 +259,8 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
         rows.push([
           r.userId, r.username, d.date, d.weekday, d.isWorkday ? 'YES' : 'NO',
           d.clockIn, d.clockOut, d.ongoing ? 'YES' : 'NO',
-          d.lunchMinutes, d.breakMinutes, d.workedHours, d.spanHours, d.streamHours,
+          d.lunchMinutes, d.breakMinutes,
+          d.workedHours, d.outsideWindowHours, d.rawWorkedHours, d.streamHours,
           d.lateMinutes, d.earlyLeaveMinutes, STATUS_LABEL[d.status],
         ]);
       }
@@ -263,7 +270,7 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
 
   const renderDayRows = (r: ReportPersonResult) => (
     <tr key={`${r.userId}-days`} className="bg-zinc-950/80">
-      <td colSpan={13} className="px-4 pb-4 pt-2">
+      <td colSpan={14} className="px-4 pb-4 pt-2">
         {r.days.length === 0 ? (
           <p className="text-[10px] text-zinc-600 uppercase font-mono py-2">No voice activity in this window.</p>
         ) : (
@@ -276,8 +283,8 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
                   <th className="py-2 px-3 text-right">Clock Out</th>
                   <th className="py-2 px-3 text-right">Lunch</th>
                   <th className="py-2 px-3 text-right">Breaks</th>
-                  <th className="py-2 px-3 text-right">Worked</th>
-                  <th className="py-2 px-3 text-right">In → Out</th>
+                  <th className="py-2 px-3 text-right">Paid</th>
+                  <th className="py-2 px-3 text-right">Not Counted</th>
                   <th className="py-2 px-3 text-right">Streamed</th>
                   <th className="py-2 px-3 text-right">Late</th>
                   <th className="py-2 px-3 text-right">Early Out</th>
@@ -304,7 +311,12 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
                     <td className="py-1.5 px-3 text-right">{fmtMinutes(d.lunchMinutes)}</td>
                     <td className="py-1.5 px-3 text-right">{fmtMinutes(d.breakMinutes)}</td>
                     <td className="py-1.5 px-3 text-right font-bold text-zinc-100">{d.workedHours.toFixed(1)}h</td>
-                    <td className="py-1.5 px-3 text-right text-zinc-400">{d.spanHours.toFixed(1)}h</td>
+                    <td
+                      className={`py-1.5 px-3 text-right ${d.outsideWindowHours > 0 ? 'text-amber-400' : 'text-zinc-600'}`}
+                      title={`${d.rawWorkedHours.toFixed(1)}h in voice, outside the paid window`}
+                    >
+                      {d.outsideWindowHours > 0 ? `-${d.outsideWindowHours.toFixed(1)}h` : '—'}
+                    </td>
                     <td className="py-1.5 px-3 text-right">{d.streamHours.toFixed(1)}h</td>
                     <td className={`py-1.5 px-3 text-right ${d.lateMinutes > report!.lateGraceMinutes ? 'text-amber-400' : 'text-zinc-500'}`}>
                       {d.lateMinutes > 0 ? `+${fmtMinutes(d.lateMinutes)}` : '—'}
@@ -476,10 +488,13 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
           <p className="mt-3 text-xs text-rose-400 font-mono">{error}</p>
         )}
         <p className="mt-3 text-[10px] text-zinc-600 font-mono uppercase">
+          Only time between <strong className="text-zinc-400">8:50 AM and 6:10 PM Miami time</strong> is payable. Earlier or later minutes earn nothing, so coming in early and leaving early does not make the hours up.
+        </p>
+        <p className="mt-1 text-[10px] text-zinc-600 font-mono uppercase">
           Target scales with the window: working days (Mon–Fri) × 8h — 1 week = 40h, 2 weeks = 80h, 4 weeks = 160h. Full pay requires streaming at least 80% of the target.
         </p>
         <p className="mt-1 text-[10px] text-zinc-700 font-mono uppercase">
-          Clock in = first voice join of the day, clock out = last voice leave. Lunch = longest gap between voice sessions (20m+); other gaps count as breaks. Late / early-out compare against the 9:00 AM – 6:30 PM Miami (ET) schedule.
+          Clock in = first voice join of the day, clock out = last voice leave (shown as they happened, even outside the paid window). Lunch = longest gap between voice sessions (20m+); other gaps count as breaks.
         </p>
       </section>
 
@@ -498,7 +513,7 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
           <div className="px-4 py-3 bg-zinc-950/60 border-b border-zinc-800 flex flex-wrap gap-x-6 gap-y-1 text-[10px] font-mono uppercase text-zinc-400">
             <span>Target: <strong className="text-zinc-100">{report.targetHours}h</strong> ({report.workingDays} days × {report.hoursPerDay}h)</span>
             <span>Full pay: <strong className="text-zinc-100">≥ {report.requiredStreamHours}h streamed</strong> ({report.requiredStreamPercent}%)</span>
-            <span>Schedule: <strong className="text-zinc-100">{fmt12(report.schedule.start)} – {fmt12(report.schedule.end)}</strong> {report.timezone.replace('America/', '')}</span>
+            <span>Paid window: <strong className="text-zinc-100">{fmt12(report.payWindow.start)} – {fmt12(report.payWindow.end)}</strong> {report.timezone.replace('America/', '')} ({report.payWindowHoursPerDay}h/day max)</span>
             <span>Grace: {report.lateGraceMinutes}m</span>
           </div>
 
@@ -514,7 +529,8 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
                   <th className="py-3 px-4 text-right">Early Out</th>
                   <th className="py-3 px-4 text-right">Lunch</th>
                   <th className="py-3 px-4 text-right">Breaks</th>
-                  <th className="py-3 px-4 text-right">Total Hours</th>
+                  <th className="py-3 px-4 text-right">Paid Hours</th>
+                  <th className="py-3 px-4 text-right">Not Counted</th>
                   <th className="py-3 px-4 text-right">% of Target</th>
                   <th className="py-3 px-4 text-right">Streamed</th>
                   <th className="py-3 px-4 text-right">% Streamed</th>
@@ -524,7 +540,7 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
               <tbody className="divide-y divide-zinc-800/80">
                 {report.results.length === 0 ? (
                   <tr>
-                    <td colSpan={13} className="py-8 text-center text-zinc-600 uppercase">
+                    <td colSpan={14} className="py-8 text-center text-zinc-600 uppercase">
                       No activity found for this selection and range.
                     </td>
                   </tr>
@@ -570,8 +586,16 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
                         </td>
                         <td className="py-3 px-4 text-right text-zinc-400">{r.lunchHours.toFixed(1)}h</td>
                         <td className="py-3 px-4 text-right text-zinc-400">{r.breakHours.toFixed(1)}h</td>
-                        <td className="py-3 px-4 text-right font-black text-zinc-100">{r.totalHours.toFixed(1)}h</td>
-                        <td className="py-3 px-4 text-right text-zinc-300">{r.totalHoursPercentOfTarget.toFixed(1)}%</td>
+                        <td className="py-3 px-4 text-right font-black text-zinc-100">{r.voiceHours.toFixed(1)}h</td>
+                        <td
+                          className={`py-3 px-4 text-right ${r.outsideWindowHours > 0 ? 'text-amber-400' : 'text-zinc-600'}`}
+                          title="Voice time outside 8:50 AM – 6:10 PM, which earns nothing"
+                        >
+                          {r.outsideWindowHours > 0 ? `-${r.outsideWindowHours.toFixed(1)}h` : '—'}
+                        </td>
+                        <td className="py-3 px-4 text-right text-zinc-300">
+                          {report.targetHours > 0 ? ((r.voiceHours / report.targetHours) * 100).toFixed(1) : '0.0'}%
+                        </td>
                         <td className="py-3 px-4 text-right font-bold text-zinc-100">{r.streamHours.toFixed(1)}h</td>
                         <td className="py-3 px-4 text-right text-zinc-300">{r.streamPercentOfTarget.toFixed(1)}%</td>
                         <td className="py-3 px-4 text-right">
@@ -598,7 +622,7 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({ members }) => {
           </div>
 
           <div className="p-3 bg-zinc-950 border-t border-zinc-800 text-[10px] text-zinc-500 font-mono uppercase">
-            Total Hours = clock in → clock out per day (includes lunch/breaks). Streamed = screen-share time. Click a member for the daily clock in / out / lunch log.
+            Paid Hours = voice time inside {fmt12(report.payWindow.start)}–{fmt12(report.payWindow.end)} {report.timezone.replace('America/', '')} only. Not Counted = voice time outside it, which earns nothing. Click a member for the day-by-day log.
           </div>
         </section>
       )}

@@ -38,8 +38,13 @@ export interface ActiveStateRow {
 
 export interface AttendanceConfig {
   timezone: string;
-  scheduleStart: string; // "HH:MM" in office timezone
+  scheduleStart: string; // "HH:MM" in office timezone — used for late / left-early
   scheduleEnd: string; // "HH:MM" in office timezone
+  // Only time inside this daily window is payable. Arriving before payStart or
+  // staying past payEnd earns nothing for those minutes, so coming in early and
+  // leaving early does not "make up" the hours.
+  payStart: string; // "HH:MM" in office timezone
+  payEnd: string; // "HH:MM" in office timezone
   hoursPerDay: number; // target hours per working day (Mon–Fri)
   requiredStreamPct: number; // fraction of target that must be streamed for full pay
   lunchMinGapMinutes: number; // longest gap at/above this counts as lunch
@@ -51,10 +56,17 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): AttendanceC
     const n = Number(v);
     return Number.isFinite(n) && n > 0 ? n : d;
   };
+  const payStart = env.PAY_WINDOW_START || '08:50';
+  const payEnd = env.PAY_WINDOW_END || '18:10';
   return {
     timezone: env.SCHEDULE_TZ || 'America/New_York',
-    scheduleStart: env.SCHEDULE_START || '09:00',
-    scheduleEnd: env.SCHEDULE_END || '18:30',
+    // Punctuality is judged against the payable window by default. Judging it
+    // against a wider schedule would mark everyone who works the full payable
+    // day as having left early, since nothing after payEnd can be earned.
+    scheduleStart: env.SCHEDULE_START || payStart,
+    scheduleEnd: env.SCHEDULE_END || payEnd,
+    payStart,
+    payEnd,
     hoursPerDay: num(env.TARGET_HOURS_PER_DAY, 8),
     requiredStreamPct: num(env.REQUIRED_STREAM_PCT, 0.8),
     lunchMinGapMinutes: num(env.LUNCH_MIN_GAP_MINUTES, 20),
@@ -129,6 +141,23 @@ export function zonedMidnightUtc(year: number, month: number, day: number, tz: s
   const off2 = tzOffsetMs(result, tz);
   if (off2 !== off1) result = guess - off2;
   return result;
+}
+
+// UTC instant of a wall-clock time on a given local date. Computed from local
+// midnight then corrected, so a DST change on that date still lands on the real
+// wall-clock time rather than drifting by an hour.
+export function zonedTimeUtc(
+  year: number,
+  month: number,
+  day: number,
+  minutesOfDay: number,
+  tz: string
+): number {
+  const candidate = zonedMidnightUtc(year, month, day, tz) + minutesOfDay * 60000;
+  const p = zonedParts(candidate, tz);
+  const drift = p.hour * 60 + p.minute - minutesOfDay;
+  if (drift !== 0 && Math.abs(drift) <= 120) return candidate - drift * 60000;
+  return candidate;
 }
 
 export function dateKey(p: { year: number; month: number; day: number }): string {
@@ -257,11 +286,13 @@ export interface DayResult {
   clockInMs: number;
   clockOutMs: number;
   ongoing: boolean; // still in voice when the report was generated
-  spanHours: number; // clock in -> clock out
-  workedHours: number; // time actually in voice
-  lunchMinutes: number; // longest gap (>= lunchMinGapMinutes)
-  breakMinutes: number; // all other gaps
-  streamHours: number;
+  spanHours: number; // payable clock in -> clock out, clipped to the pay window
+  workedHours: number; // payable time in voice (inside the pay window only)
+  rawWorkedHours: number; // all voice time that day, window ignored
+  outsideWindowHours: number; // voice time that earned nothing (before payStart / after payEnd)
+  lunchMinutes: number; // longest gap (>= lunchMinGapMinutes) inside the window
+  breakMinutes: number; // all other gaps inside the window
+  streamHours: number; // payable stream time
   lateMinutes: number;
   earlyLeaveMinutes: number;
   status: DayStatus;
@@ -273,9 +304,12 @@ export interface ReportPersonResult {
   userTag: string;
   avatarUrl: string;
   sessionCount: number;
-  voiceHours: number;
+  voiceHours: number; // payable
+  rawVoiceHours: number; // before the pay window is applied
+  outsideWindowHours: number; // voiceHours the window threw away
   videoHours: number;
-  streamHours: number;
+  streamHours: number; // payable
+  rawStreamHours: number;
   streamPercentOfTarget: number;
   paidFull: boolean;
   daysActive: number;
@@ -303,6 +337,8 @@ export interface ReportResponse {
   endDate: string;
   timezone: string;
   schedule: { start: string; end: string };
+  payWindow: { start: string; end: string };
+  payWindowHoursPerDay: number;
   hoursPerDay: number;
   workingDays: number;
   calendarDays: number;
@@ -339,7 +375,33 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
   const requiredStreamHours = round2(targetHours * cfg.requiredStreamPct);
   const scheduleStartMin = parseClock(cfg.scheduleStart);
   const scheduleEndMin = parseClock(cfg.scheduleEnd);
+  const payStartMin = parseClock(cfg.payStart);
+  const payEndMin = parseClock(cfg.payEnd);
+  const payWindowHoursPerDay = round2(Math.max(0, payEndMin - payStartMin) / 60);
   const dayByKey = new Map(days.map((d) => [d.key, d]));
+
+  // The payable window for one calendar day, as absolute instants.
+  const windowCache = new Map<string, { startMs: number; endMs: number }>();
+  const payWindowFor = (key: string) => {
+    let w = windowCache.get(key);
+    if (!w) {
+      const p = parseDateKey(key);
+      w = {
+        startMs: zonedTimeUtc(p.year, p.month, p.day, payStartMin, tz),
+        endMs: zonedTimeUtc(p.year, p.month, p.day, payEndMin, tz),
+      };
+      windowCache.set(key, w);
+    }
+    return w;
+  };
+
+  interface DayAgg {
+    voice: Interval[]; // clipped to the pay window — what actually earns
+    rawVoice: Interval[]; // as recorded, used for clock in / clock out
+    streamSeconds: number; // clipped
+    rawStreamSeconds: number;
+    ongoing: boolean;
+  }
 
   interface UserAgg {
     userId: string;
@@ -347,10 +409,10 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
     userTag: string;
     avatarUrl: string;
     sessionCount: number;
-    voiceSeconds: number;
+    rawVoiceSeconds: number;
     videoSeconds: number;
-    streamSeconds: number;
-    days: Map<string, { voice: Interval[]; streamSeconds: number; ongoing: boolean }>;
+    rawStreamSeconds: number;
+    days: Map<string, DayAgg>;
   }
   const byUser = new Map<string, UserAgg>();
 
@@ -363,9 +425,9 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
         userTag,
         avatarUrl: avatarUrl || '',
         sessionCount: 0,
-        voiceSeconds: 0,
+        rawVoiceSeconds: 0,
         videoSeconds: 0,
-        streamSeconds: 0,
+        rawStreamSeconds: 0,
         days: new Map(),
       };
       byUser.set(id, u);
@@ -385,22 +447,31 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
     const endMs = Math.min(rawEnd, range.endMs);
     if (!(endMs > startMs)) return;
     const seconds = (endMs - startMs) / 1000;
-    if (type === 'voice') user.voiceSeconds += seconds;
+    if (type === 'voice') user.rawVoiceSeconds += seconds;
     else if (type === 'video') user.videoSeconds += seconds;
-    else user.streamSeconds += seconds;
+    else user.rawStreamSeconds += seconds;
 
     if (type === 'video') return;
     for (const seg of splitByLocalDay(startMs, endMs, tz)) {
       let day = user.days.get(seg.key);
       if (!day) {
-        day = { voice: [], streamSeconds: 0, ongoing: false };
+        day = { voice: [], rawVoice: [], streamSeconds: 0, rawStreamSeconds: 0, ongoing: false };
         user.days.set(seg.key, day);
       }
+
+      // Second clip: the payable window for this calendar day. Anything before
+      // payStart or after payEnd is recorded but earns nothing.
+      const w = payWindowFor(seg.key);
+      const paidStart = Math.max(seg.startMs, w.startMs);
+      const paidEnd = Math.min(seg.endMs, w.endMs);
+
       if (type === 'voice') {
-        day.voice.push({ startMs: seg.startMs, endMs: seg.endMs });
+        day.rawVoice.push({ startMs: seg.startMs, endMs: seg.endMs });
+        if (paidEnd > paidStart) day.voice.push({ startMs: paidStart, endMs: paidEnd });
         if (ongoing && seg.endMs === endMs) day.ongoing = true;
       } else {
-        day.streamSeconds += (seg.endMs - seg.startMs) / 1000;
+        day.rawStreamSeconds += (seg.endMs - seg.startMs) / 1000;
+        if (paidEnd > paidStart) day.streamSeconds += (paidEnd - paidStart) / 1000;
       }
     }
   };
@@ -453,6 +524,7 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
     const dayResults: DayResult[] = [];
     let spanSecondsSum = 0;
     let workedSecondsSum = 0;
+    let payableStreamSeconds = 0;
     let lunchMinutesSum = 0;
     let breakMinutesSum = 0;
     let clockInMinSum = 0;
@@ -464,8 +536,11 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
     let onTimeDays = 0;
 
     for (const [key, d] of u.days) {
+      // `merged` is payable time (inside the window); `rawMerged` is what they
+      // actually did, which is what clock in / clock out and lateness report on.
       const merged = mergeIntervals(d.voice);
-      if (merged.length === 0) continue; // stream-only bucket without voice (shouldn't happen)
+      const rawMerged = mergeIntervals(d.rawVoice);
+      if (rawMerged.length === 0) continue; // stream-only bucket without voice
       const info = dayByKey.get(key);
       const p = parseDateKey(key);
       const dayStart = info?.startMs ?? zonedMidnightUtc(p.year, p.month, p.day, tz);
@@ -473,10 +548,14 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
       const weekdayIdx = info?.weekday ?? zonedParts(dayStart, tz).weekday;
       const isWorkday = weekdayIdx >= 1 && weekdayIdx <= 5;
 
-      const clockInMs = merged[0].startMs;
-      const clockOutMs = merged[merged.length - 1].endMs;
+      const clockInMs = rawMerged[0].startMs;
+      const clockOutMs = rawMerged[rawMerged.length - 1].endMs;
       const workedSeconds = merged.reduce((acc, iv) => acc + (iv.endMs - iv.startMs) / 1000, 0);
-      const spanSeconds = (clockOutMs - clockInMs) / 1000;
+      const rawWorkedSeconds = rawMerged.reduce((acc, iv) => acc + (iv.endMs - iv.startMs) / 1000, 0);
+      // Payable span: first to last payable minute, so lunch inside the window
+      // still counts toward the day the way it did before.
+      const spanSeconds =
+        merged.length > 0 ? (merged[merged.length - 1].endMs - merged[0].startMs) / 1000 : 0;
 
       let longestGap = 0;
       let totalGap = 0;
@@ -504,6 +583,7 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
 
       spanSecondsSum += spanSeconds;
       workedSecondsSum += workedSeconds;
+      payableStreamSeconds += d.streamSeconds;
       lunchMinutesSum += lunchMinutes;
       breakMinutesSum += breakMinutes;
       clockInMinSum += clockInMin;
@@ -525,6 +605,8 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
         ongoing: d.ongoing,
         spanHours: round2(spanSeconds / 3600),
         workedHours: round2(workedSeconds / 3600),
+        rawWorkedHours: round2(rawWorkedSeconds / 3600),
+        outsideWindowHours: round2(Math.max(0, rawWorkedSeconds - workedSeconds) / 3600),
         lunchMinutes: Math.round(lunchMinutes),
         breakMinutes: Math.round(breakMinutes),
         streamHours: round2(d.streamSeconds / 3600),
@@ -540,9 +622,12 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
     const todayKey = dateKey(zonedParts(now, tz));
     const workdaysMissed = days.filter((d) => d.isWorkday && d.key < todayKey && !activeKeys.has(d.key)).length;
 
-    const voiceHours = round2(u.voiceSeconds / 3600);
+    // Headline numbers are payable only — time outside 08:50–18:10 earns nothing.
+    const voiceHours = round2(workedSecondsSum / 3600);
+    const rawVoiceHours = round2(u.rawVoiceSeconds / 3600);
     const videoHours = round2(u.videoSeconds / 3600);
-    const streamHours = round2(u.streamSeconds / 3600);
+    const streamHours = round2(payableStreamSeconds / 3600);
+    const rawStreamHours = round2(u.rawStreamSeconds / 3600);
     const totalHours = round2(spanSecondsSum / 3600);
     const pct = (h: number) => (targetHours > 0 ? round2((h / targetHours) * 100) : 0);
     const avgClockIn = daysActive > 0 ? formatClock(clockInMinSum / daysActive) : null;
@@ -555,8 +640,11 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
       avatarUrl: u.avatarUrl,
       sessionCount: u.sessionCount,
       voiceHours,
+      rawVoiceHours,
+      outsideWindowHours: round2(Math.max(0, rawVoiceHours - voiceHours)),
       videoHours,
       streamHours,
+      rawStreamHours,
       streamPercentOfTarget: pct(streamHours),
       paidFull: targetHours > 0 && streamHours >= requiredStreamHours,
       daysActive,
@@ -586,6 +674,8 @@ export function buildAttendanceReport(input: BuildReportInput): ReportResponse {
     endDate: new Date(range.endMs - 1).toISOString(),
     timezone: tz,
     schedule: { start: cfg.scheduleStart, end: cfg.scheduleEnd },
+    payWindow: { start: cfg.payStart, end: cfg.payEnd },
+    payWindowHoursPerDay,
     hoursPerDay: cfg.hoursPerDay,
     workingDays,
     calendarDays: days.length,
